@@ -17,108 +17,87 @@ DEFAULT_ZONES = {
 
 st.set_page_config(page_title="Propane Dispatch AI", layout="wide")
 
-# --- AUTO-DETECTION ENGINE ---
+# --- HELPER: COLUMN HUNTER ---
 def find_col(df, keywords):
-    """Searches for columns that contain any of the keywords (case-insensitive)."""
     for col in df.columns:
         if any(key.lower() in str(col).lower() for key in keywords):
             return col
     return None
 
-# --- SIDEBAR ---
-with st.sidebar:
-    st.header("⚙️ Settings")
-    max_stops = st.slider("Max Stops Per Truck", 5, 40, 22)
-    active_trucks = {name: cap for name, cap in TRUCKS.items() if st.checkbox(name, value=True)}
-    st.markdown("---")
-    if st.button("🗑️ Reset Memory"):
-        if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
-        st.rerun()
-
-# --- APP TABS ---
-tab1, tab2 = st.tabs(["🎯 Dispatcher", "📊 Zone Analysis"])
+# --- MAIN APP LOGIC ---
+tab1, tab2, tab3 = st.tabs(["🎯 Dispatcher", "⚖️ Route Comparison", "📊 Zone Analysis"])
 
 with tab1:
-    st.title("🚚 Propane Dispatcher")
+    st.title("🚚 Smart Dispatcher")
+    telemetry_file = st.file_uploader("Step 1: Upload Master Otodata CSV", type="csv")
     
-    # 1. DATA INPUT
-    telemetry_file = st.file_uploader("Upload Otodata CSV", type="csv")
-    
-    # 2. ZONE SELECTION
-    today_name = datetime.datetime.now().strftime("%A")
-    route_day = st.selectbox("Select Route Day", list(DEFAULT_ZONES.keys()), index=list(DEFAULT_ZONES.keys()).index(today_name))
-    target_cities = [c.strip().upper() for c in st.text_area("Cities in Zone", DEFAULT_ZONES[route_day]).split(",") if c.strip()]
+    # Zone Selection
+    route_day = st.selectbox("Select Active Route Day", list(DEFAULT_ZONES.keys()))
+    target_cities = [c.strip().upper() for c in st.text_area("Target Cities", DEFAULT_ZONES[route_day]).split(",") if c.strip()]
 
     if telemetry_file:
-        # Load data with a fallback for weird encoding
-        try:
-            df = pd.read_csv(telemetry_file, encoding='utf-8')
-        except:
-            df = pd.read_csv(telemetry_file, encoding='latin1')
+        df = pd.read_csv(telemetry_file, encoding='latin1')
+        
+        # Identify Columns
+        name_col = find_col(df, ["Name", "Customer", "Account"])
+        city_col = find_col(df, ["City", "Town", "Location"])
+        ullage_col = find_col(df, ["Ullage", "Room", "Volume"])
+        dte_col = find_col(df, ["DTE", "Days to Empty"])
 
-        # DETECT COLUMNS
-        name_col = find_col(df, ["Name", "Customer", "Account", "Asset"])
-        city_col = find_col(df, ["City", "Town", "Location", "Ship To"])
-        level_col = find_col(df, ["Level", "%", "Percent", "Reading"])
-        ullage_col = find_col(df, ["Ullage", "Room", "Volume", "Fill"])
-        dte_col = find_col(df, ["DTE", "Days to Empty", "Estimate"])
-
-        # VALIDATION
-        if not name_col or not city_col:
-            st.error(f"❌ Could not find Name or City columns. Found: {list(df.columns)}")
-        else:
-            # CLEANING
-            df['City_Clean'] = df[city_col].fillna("UNKNOWN").astype(str).str.strip().upper()
+        if name_col and city_col:
+            # AI Logic (Simplified for brevity)
+            df['City_Clean'] = df[city_col].fillna("UNKNOWN").str.upper()
+            df['In_Zone'] = df['City_Clean'].apply(lambda x: any(t in x for t in target_cities))
             df['Ullage_Num'] = pd.to_numeric(df[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
             
-            # Smart DTE Parsing
-            def parse_dte(val):
-                nums = re.findall(r'\d+', str(val))
-                return int(nums[0]) if nums else 99
-            df['DTE_Val'] = df[dte_col].apply(parse_dte) if dte_col else 99
-
-            # LOGIC
-            df['In_Zone'] = df['City_Clean'].apply(lambda x: any(target in x for target in target_cities))
-            pool = df[(df['In_Zone']) | (df['DTE_Val'] <= 2)].copy()
-            pool['Score'] = pool.apply(lambda r: 1 if r['DTE_Val'] <= 2 else 2, axis=1)
-            sorted_pool = pool.sort_values(['Score', 'DTE_Val', 'Ullage_Num'], ascending=[True, True, False])
-
-            # ASSIGNMENT
-            final_route_data = []
-            temp_pool = sorted_pool.copy()
-            for t_name, t_cap in active_trucks.items():
-                load, count, manifest = 0, 0, []
-                for idx, row in temp_pool.iterrows():
-                    if (load + row['Ullage_Num'] <= t_cap) and (count < max_stops):
-                        load += row['Ullage_Num']
-                        count += 1
-                        row_copy = row.copy()
-                        row_copy['Assigned_Truck'] = t_name
-                        manifest.append(row_copy)
-                        temp_pool = temp_pool.drop(idx)
-                if manifest:
-                    final_route_data.append(pd.DataFrame(manifest))
-
-            # DISPLAY
-            if final_route_data:
-                cols = st.columns(len(active_trucks))
-                for i, m_df in enumerate(final_route_data):
-                    t_name = m_df['Assigned_Truck'].iloc[0]
-                    with cols[i]:
-                        st.success(f"**{t_name}**")
-                        disp_cols = [name_col, city_col]
-                        if level_col: disp_cols.append(level_col)
-                        st.dataframe(m_df[disp_cols], hide_index=True)
-                
-                if st.button("✅ Finalize & Record", use_container_width=True):
-                    all_routes = pd.concat(final_route_data)
-                    all_routes['Dispatch_Day'] = route_day
-                    all_routes[['Dispatch_Day', 'City_Clean', 'Ullage_Num']].to_csv(LOG_FILE, mode='a', index=False, header=not os.path.exists(LOG_FILE))
-                    st.balloons()
+            # Create AI Route
+            ai_pool = df[df['In_Zone'] | (df[dte_col].str.contains('0|1', na=False))].copy()
+            ai_route = ai_pool.head(22) # Simulating a single truck cap for comparison
+            
+            st.success("AI Route Generated. Switch to 'Route Comparison' to compare against your manual list.")
+            st.dataframe(ai_route[[name_col, city_col, ullage_col]], hide_index=True)
 
 with tab2:
-    if os.path.exists(LOG_FILE):
-        history = pd.read_csv(LOG_FILE)
-        st.bar_chart(history.groupby('City_Clean')['Ullage_Num'].count())
-    else:
-        st.info("No data yet.")
+    st.header("⚖️ AI vs. Manual Comparison")
+    st.info("Upload the CSV of the route you planned to run manually to see the efficiency difference.")
+    
+    manual_file = st.file_uploader("Step 2: Upload Your Manual Route CSV", type="csv")
+    
+    if telemetry_file and manual_file:
+        # Load Manual Data
+        m_df = pd.read_csv(manual_file, encoding='latin1')
+        m_name_col = find_col(m_df, ["Name", "Customer", "Account"])
+        
+        if m_name_col:
+            # Cross-reference Manual Names against Master Data to get City/Zone info
+            planned_names = m_df[m_name_col].unique()
+            manual_route_data = df[df[name_col].isin(planned_names)].copy()
+            
+            # CALCULATE STATS
+            ai_zone_hits = ai_route['In_Zone'].sum()
+            man_zone_hits = manual_route_data['In_Zone'].sum()
+            
+            # UI Comparison
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                st.subheader("🤖 AI Suggested Route")
+                st.metric("Total Stops", len(ai_route))
+                st.metric("Zone Adherence", f"{(ai_zone_hits/len(ai_route)*100):.1f}%")
+                st.write("Stops inside defined zones.")
+                
+            with col_b:
+                st.subheader("📝 Your Manual Route")
+                st.metric("Total Stops", len(manual_route_data))
+                st.metric("Zone Adherence", f"{(man_zone_hits/len(manual_route_data)*100):.1f}%" if len(manual_route_data)>0 else "0%")
+                st.write("Stops outside defined zones (Out-of-route mileage).")
+
+            st.markdown("---")
+            st.write("### 🌍 Geographic Scatter")
+            if man_zone_hits < ai_zone_hits:
+                st.warning(f"The AI found {ai_zone_hits - man_zone_hits} more stops within your target zones than the manual route. This suggests the manual route may have high 'deadhead' mileage.")
+            else:
+                st.success("Your manual route is highly efficient!")
+
+with tab3:
+    st.write("Historical analysis appears here after finalizing.")

@@ -69,4 +69,64 @@ with tab1:
             
             def score_efficiency(row):
                 if row['DTE_Val'] <= 1: return 1
-                if row
+                if row['In_Zone'] and row['DTE_Val'] <= 4: return 2
+                return 3
+
+            pool['Score'] = pool.apply(score_efficiency, axis=1)
+            sorted_pool = pool.sort_values(['Score', 'DTE_Val', 'Ullage_Num'], ascending=[True, True, False])
+
+            # ALLOCATION
+            st.header(f"Manifests for {route_day}")
+            active_trucks = {name: cap for name, cap in TRUCKS.items() if st.sidebar.checkbox(name, value=True)}
+            
+            all_scheduled_stops = []
+
+            for t_name, t_cap in active_trucks.items():
+                load = 0
+                stop_count = 0
+                manifest = []
+                
+                # Allocation Loop
+                for idx, row in sorted_pool.iterrows():
+                    if (load + row['Ullage_Num'] <= t_cap) and (stop_count < max_stops):
+                        load += row['Ullage_Num']
+                        stop_count += 1
+                        row_copy = row.copy()
+                        row_copy['Assigned_Truck'] = t_name
+                        row_copy['Dispatch_Date'] = datetime.date.today()
+                        row_copy['Dispatch_Day'] = route_day
+                        manifest.append(row_copy)
+                        all_scheduled_stops.append(row_copy)
+                        sorted_pool = sorted_pool.drop(idx)
+                
+                if manifest:
+                    m_df = pd.DataFrame(manifest)
+                    with st.expander(f"📖 {t_name} | {stop_count} Stops | {load:.0f} Gal", expanded=True):
+                        st.dataframe(m_df[[city_col, 'Ullage_Num', 'DTE_Val']].sort_values(city_col))
+                        csv_data = m_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(label=f"Download {t_name} CSV", data=csv_data, file_name=f"{t_name}_{route_day}.csv")
+
+            # --- MEMORY LOGGING ---
+            if all_scheduled_stops:
+                log_df = pd.DataFrame(all_scheduled_stops)
+                log_entry = log_df[['Dispatch_Date', 'Dispatch_Day', 'City_Clean', 'Ullage_Num']]
+                if not os.path.isfile(LOG_FILE):
+                    log_entry.to_csv(LOG_FILE, index=False)
+                else:
+                    log_entry.to_csv(LOG_FILE, mode='a', header=False, index=False)
+                st.success(f"📝 Memory Updated: {len(all_scheduled_stops)} stops recorded.")
+
+with tab2:
+    st.header("📊 Zone Performance Analysis")
+    if os.path.isfile(LOG_FILE):
+        history = pd.read_csv(LOG_FILE)
+        st.write("### Deliveries per City")
+        city_counts = history['City_Clean'].value_counts().reset_index()
+        city_counts.columns = ['City', 'Stops']
+        st.bar_chart(city_counts.set_index('City'))
+        
+        if st.button("Clear Memory Log"):
+            os.remove(LOG_FILE)
+            st.rerun()
+    else:
+        st.info("Run a route to start tracking trends.")

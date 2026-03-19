@@ -51,12 +51,13 @@ with tab1:
                 if any(n.lower() in str(c).lower() for n in names): return c
             return None
 
+        # Added "Level" and "Percent" to the search criteria
         name_col = find_col(df, ["Name", "Customer", "Account Name"])
         city_col = find_col(df, ["City", "Town", "Location"])
+        level_col = find_col(df, ["Level", "Percent", "Current %", "Tank Level"])
         ullage_col = find_col(df, ["Ullage", "Room", "Volume"])
         dte_col = find_col(df, ["DTE", "Days to Empty"])
 
-        # FIXED: Added the missing colon and structured the logic correctly
         if not name_col or not city_col:
             st.error("❌ Required columns (Name/City) missing. Check your CSV.")
         else:
@@ -69,6 +70,8 @@ with tab1:
                 
             df['DTE_Val'] = df[dte_col].apply(safe_get_dte)
             df['Ullage_Num'] = pd.to_numeric(df[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
+            # Keeping the Level/Percent as a string for display (e.g., "15%")
+            df['Level_Disp'] = df[level_col].fillna("N/A") if level_col else "N/A"
 
             # --- POOLING & SCORING ---
             df['In_Zone'] = df['City_Clean'].apply(lambda x: any(t in x for t in target_cities))
@@ -110,41 +113,3 @@ with tab1:
                 
                 s1, s2, s3 = st.columns(3)
                 s1.metric("Scheduled Gallons", f"{total_gals:,.0f}")
-                s2.metric("Scheduled Stops", f"{total_stops}")
-                s3.metric("Remaining in Pool", f"{len(temp_pool)}")
-
-                st.subheader("3. Daily Manifests")
-                m_cols = st.columns(len(active_trucks)) if active_trucks else st.columns(1)
-                
-                for i, (t_name, _) in enumerate(active_trucks.items()):
-                    with m_cols[i]:
-                        t_df_list = [d for d in final_route_data if d['Assigned_Truck'].iloc[0] == t_name]
-                        if t_df_list:
-                            t_df = t_df_list[0]
-                            st.success(f"**{t_name}**")
-                            display_cols = [name_col, city_col, 'Ullage_Num', dte_col]
-                            st.dataframe(t_df[display_cols].sort_values(city_col), use_container_width=True, hide_index=True)
-                            csv_data = t_df.to_csv(index=False).encode('utf-8')
-                            st.download_button(f"📥 Export {t_name}", csv_data, f"{t_name}.csv", key=f"dl_{t_name}")
-                        else:
-                            st.warning(f"**{t_name}**: No assignments.")
-
-                st.markdown("---")
-                if st.button("🚀 FINALIZE & RECORD ALL ROUTES", use_container_width=True):
-                    full_log = pd.concat(final_route_data)
-                    log_entry = full_log[['Dispatch_Date', 'Dispatch_Day', 'City_Clean', 'Ullage_Num']]
-                    if not os.path.isfile(LOG_FILE): log_entry.to_csv(LOG_FILE, index=False)
-                    else: log_entry.to_csv(LOG_FILE, mode='a', header=False, index=False)
-                    st.balloons()
-                    st.success("Routes recorded in Zone Analysis memory!")
-            else:
-                st.warning("No customers matched. Adjust zones or check for Emergency/Optimal Fill criteria.")
-
-with tab2:
-    st.header("📊 Zone Performance Analysis")
-    if os.path.isfile(LOG_FILE):
-        history = pd.read_csv(LOG_FILE)
-        st.write("### Deliveries per City")
-        st.bar_chart(history['City_Clean'].value_counts())
-    else:
-        st.info("No data in memory yet. Finalize a route to see analysis.")

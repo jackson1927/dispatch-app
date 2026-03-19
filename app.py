@@ -16,6 +16,7 @@ ZONES = {
 st.set_page_config(page_title="Propane Auto-Dispatch Pro", layout="wide")
 st.title("🚚 Smart-Zone Dispatcher")
 
+# --- HELPERS ---
 def find_column(df, possible_names):
     for col in df.columns:
         if any(name.lower() in str(col).lower() for name in possible_names):
@@ -28,6 +29,11 @@ def get_dto_num(val):
     nums = re.findall(r'\d+', val)
     return int(nums[0]) if nums else 999
 
+def clean_acct(val):
+    if pd.isna(val): return ""
+    match = re.search(r'(\d+)', str(val))
+    return match.group(1).lstrip('0') if match else ""
+
 # --- SIDEBAR ---
 st.sidebar.header("Route Settings")
 today_name = datetime.datetime.now().strftime("%A")
@@ -38,45 +44,68 @@ active_trucks = {name: st.sidebar.number_input(f"{name} Cap", value=cap)
                  for name, cap in TRUCKS.items() if st.sidebar.checkbox(name, value=True)}
 
 # --- FILE UPLOADS ---
-telemetry_file = st.file_uploader("Upload Otodata Export (CSV)", type="csv")
+col1, col2 = st.columns(2)
+with col1:
+    telemetry_file = st.file_uploader("1. Upload Otodata Tank Levels (CSV)", type="csv")
+with col2:
+    history_file = st.file_uploader("2. Upload Delivery History (CSV) - Optional", type="csv")
 
 if telemetry_file:
-    df = pd.read_csv(telemetry_file)
+    df_tel = pd.read_csv(telemetry_file)
     
-    # DYNAMIC COLUMN MATCHING
-    city_col = find_column(df, ["City", "Town", "Location", "Ship To"])
-    name_col = find_column(df, ["Name", "Customer"])
-    ullage_col = find_column(df, ["Ullage", "Room", "Volume"])
-    dto_col = find_column(df, ["DTO", "Days to Empty", "Days"])
+    # Identify key columns in Otodata file
+    city_col = find_column(df_tel, ["City", "Town", "Location", "Ship To"])
+    acct_col_tel = find_column(df_tel, ["Account", "Customer Number", "Acct"])
+    name_col = find_column(df_tel, ["Name", "Customer"])
+    ullage_col = find_column(df_tel, ["Ullage", "Room", "Volume"])
+    dto_col = find_column(df_tel, ["DTO", "Days to Empty", "Days"])
 
     if not city_col:
-        st.error(f"❌ Could not find a 'City' column. Headers found: {df.columns.tolist()}")
+        st.error(f"❌ Error: 'City' column not found in Box 1. Headers seen: {df_tel.columns.tolist()}")
     else:
-        # DATA CLEANING
-        df['City_Clean'] = df[city_col].fillna("UNKNOWN").apply(lambda x: str(x).strip().upper())
-        df['DTO_Num'] = df[dto_col].apply(get_dto_num) if dto_col else 999
-        df['Ullage_Num'] = pd.to_numeric(df[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0) if ullage_col else 0
+        # Data Cleaning
+        df_tel['City_Clean'] = df_tel[city_col].fillna("UNKNOWN").apply(lambda x: str(x).strip().upper())
+        df_tel['DTO_Num'] = df_tel[dto_col].apply(get_dto_num) if dto_col else 999
+        df_tel['Ullage_Num'] = pd.to_numeric(df_tel[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0) if ullage_col else 0
+        df_tel['Acct_Key'] = df_tel[acct_col_tel].apply(clean_acct) if acct_col_tel else ""
+
+        # Smart Ullage Logic (History + Sensor)
+        if history_file:
+            df_hist = pd.read_csv(history_file)
+            acct_col_hist = find_column(df_hist, ["Account", "Acct"])
+            qty_cols = [c for c in df_hist.columns if 'qty' in c.lower()]
+            
+            if acct_col_hist and qty_cols:
+                df_hist['Acct_Key'] = df_hist[acct_col_hist].apply(clean_acct)
+                df_hist['Avg_Drop'] = df_hist[qty_cols].replace(0, pd.NA).mean(axis=1).fillna(0)
+                hist_map = df_hist.groupby('Acct_Key')['Avg_Drop'].first()
+                # Use the smaller of the two: Sensor room or History average
+                df_tel['Planned_Gals'] = df_tel.apply(lambda x: min(x['Ullage_Num'], hist_map.get(x['Acct_Key'], x['Ullage_Num'])), axis=1)
+                st.success("✅ History linked! Calculations are now 'Smart'.")
+            else:
+                df_tel['Planned_Gals'] = df_tel['Ullage_Num']
+        else:
+            df_tel['Planned_Gals'] = df_tel['Ullage_Num']
 
         # SCORING
         def score_row(row):
             if row['DTO_Num'] <= 1: return 1 
-            if any(target.upper() in row['City_Clean'] for target in target_cities) and row['Ullage_Num'] > 150: return 2
+            if any(target.upper() in row['City_Clean'] for target in target_cities) and row['Planned_Gals'] > 150: return 2
             if any(target.upper() in row['City_Clean'] for target in target_cities): return 3
-            if row['DTO_Num'] <= 3: return 4
-            return 5
+            return 4
 
-        df['Route_Priority'] = df.apply(score_row, axis=1)
-        pool = df[df['Ullage_Num'] > 40].sort_values(['Route_Priority', 'Ullage_Num'], ascending=[True, False])
+        df_tel['Route_Priority'] = df_tel.apply(score_row, axis=1)
+        pool = df_tel[df_tel['Planned_Gals'] > 40].sort_values(['Route_Priority', 'Planned_Gals'], ascending=[True, False])
 
         # ALLOCATION
-        st.header(f"Routes for {route_day}")
+        st.header(f"Proposed Routes for {route_day}")
         final_output = []
         for t_name, t_cap in active_trucks.items():
             load = 0
             assigned_indices = []
             for idx, row in pool.iterrows():
-                if load + row['Ullage_Num'] <= t_cap:
-                    load += row['Ullage_Num']
+                if load + row['Planned_Gals'] <= t_cap:
+                    load += row['Planned_Gals']
                     row_dict = row.to_dict()
                     row_dict['Assigned_Truck'] = t_name
                     final_output.append(row_dict)
@@ -88,8 +117,8 @@ if telemetry_file:
             for t_name in active_trucks.keys():
                 t_df = res_df[res_df['Assigned_Truck'] == t_name]
                 if not t_df.empty:
-                    with st.expander(f"📖 {t_name} Manifest - Total: {t_df['Ullage_Num'].sum():.0f} gal", expanded=True):
-                        display_cols = [c for c in [name_col, city_col, ullage_col, 'DTO'] if c]
-                        st.dataframe(t_df[display_cols].sort_values(city_col))
+                    with st.expander(f"📖 {t_name} - {t_df['Planned_Gals'].sum():.0f} gal total", expanded=True):
+                        disp = t_df[[name_col, city_col, 'Planned_Gals', 'DTO']].sort_values(city_col)
+                        st.dataframe(disp)
                         csv = t_df.to_csv(index=False).encode('utf-8')
-                        st.download_button(f"Download {t_name} CSV", csv, f"{t_name}_{route_day}.csv")
+                        st.download_button(f"Download {t_name} Manifest", csv, f"{t_name}_{route_day}.csv")

@@ -17,14 +17,6 @@ DEFAULT_ZONES = {
 
 st.set_page_config(page_title="Propane Dispatch AI", layout="wide", initial_sidebar_state="expanded")
 
-# --- CUSTOM CSS ---
-st.markdown("""
-    <style>
-    .stMetric { background-color: #ffffff; padding: 10px; border-radius: 10px; border: 1px solid #eee; }
-    [data-testid="stExpander"] { background-color: white; border-radius: 10px; }
-    </style>
-    """, unsafe_allow_html=True)
-
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Controls")
@@ -48,14 +40,12 @@ with tab1:
         st.subheader("2. Zone Management")
         today_name = datetime.datetime.now().strftime("%A")
         route_day = st.selectbox("Active Day", list(DEFAULT_ZONES.keys()), index=list(DEFAULT_ZONES.keys()).index(today_name))
-        # FIXED: Completed the text_area assignment below
         current_zone_text = st.text_area("Edit Cities", value=DEFAULT_ZONES[route_day], height=70)
         target_cities = [c.strip().upper() for c in current_zone_text.split(",") if c.strip()]
 
     if telemetry_file:
         df = pd.read_csv(telemetry_file)
         
-        # COLUMN IDENTIFICATION
         def find_col(df, names):
             for c in df.columns:
                 if any(n.lower() in str(c).lower() for n in names): return c
@@ -67,13 +57,5 @@ with tab1:
         dte_col = find_col(df, ["DTE", "Days to Empty"])
 
         if not name_col or not city_col:
-            st.error("❌ Could not find 'Name' or 'City' columns. Check your CSV headers.")
-        else:
-            # CLEANING
-            df['City_Clean'] = df[city_col].fillna("UNKNOWN").apply(lambda x: str(x).strip().upper())
-            df['DTE_Val'] = df[dte_col].apply(lambda x: int(re.findall(r'\d+', str(x))[0]) if re.findall(r'\d+', str(x)) else 999)
-            df['Ullage_Num'] = pd.to_numeric(df[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
-
-            # SCORING & POOLING
-            df['In_Zone'] = df['City_Clean'].apply(lambda x: any(t in x for t in target_cities))
-            pool = df[(df['In_Zone']) | (df['DTE_Val'] <=
+            st.error("❌ Required columns (Name/City) missing. Check your CSV.")
+        else

@@ -79,54 +79,71 @@ with tab1:
             st.header(f"Manifests for {route_day}")
             active_trucks = {name: cap for name, cap in TRUCKS.items() if st.sidebar.checkbox(name, value=True)}
             
-            all_scheduled_stops = []
+            final_route_data = []
 
             for t_name, t_cap in active_trucks.items():
                 load = 0
                 stop_count = 0
                 manifest = []
                 
-                # Allocation Loop
                 for idx, row in sorted_pool.iterrows():
                     if (load + row['Ullage_Num'] <= t_cap) and (stop_count < max_stops):
                         load += row['Ullage_Num']
                         stop_count += 1
                         row_copy = row.copy()
                         row_copy['Assigned_Truck'] = t_name
-                        row_copy['Dispatch_Date'] = datetime.date.today()
-                        row_copy['Dispatch_Day'] = route_day
                         manifest.append(row_copy)
-                        all_scheduled_stops.append(row_copy)
                         sorted_pool = sorted_pool.drop(idx)
                 
                 if manifest:
                     m_df = pd.DataFrame(manifest)
+                    # Prepare data for memory logging later
+                    m_df['Dispatch_Date'] = datetime.date.today()
+                    m_df['Dispatch_Day'] = route_day
+                    final_route_data.append(m_df)
+                    
                     with st.expander(f"📖 {t_name} | {stop_count} Stops | {load:.0f} Gal", expanded=True):
                         st.dataframe(m_df[[city_col, 'Ullage_Num', 'DTE_Val']].sort_values(city_col))
                         csv_data = m_df.to_csv(index=False).encode('utf-8')
                         st.download_button(label=f"Download {t_name} CSV", data=csv_data, file_name=f"{t_name}_{route_day}.csv")
 
-            # --- MEMORY LOGGING ---
-            if all_scheduled_stops:
-                log_df = pd.DataFrame(all_scheduled_stops)
-                log_entry = log_df[['Dispatch_Date', 'Dispatch_Day', 'City_Clean', 'Ullage_Num']]
-                if not os.path.isfile(LOG_FILE):
-                    log_entry.to_csv(LOG_FILE, index=False)
-                else:
-                    log_entry.to_csv(LOG_FILE, mode='a', header=False, index=False)
-                st.success(f"📝 Memory Updated: {len(all_scheduled_stops)} stops recorded.")
+            # --- FINALIZATION BUTTON ---
+            st.markdown("---")
+            if final_route_data:
+                if st.button("✅ Finalize & Record These Routes"):
+                    full_log = pd.concat(final_route_data)
+                    log_entry = full_log[['Dispatch_Date', 'Dispatch_Day', 'City_Clean', 'Ullage_Num']]
+                    
+                    if not os.path.isfile(LOG_FILE):
+                        log_entry.to_csv(LOG_FILE, index=False)
+                    else:
+                        log_entry.to_csv(LOG_FILE, mode='a', header=False, index=False)
+                    st.balloons()
+                    st.success(f"Successfully recorded {len(full_log)} stops to Zone Analysis memory.")
 
 with tab2:
     st.header("📊 Zone Performance Analysis")
     if os.path.isfile(LOG_FILE):
         history = pd.read_csv(LOG_FILE)
-        st.write("### Deliveries per City")
-        city_counts = history['City_Clean'].value_counts().reset_index()
-        city_counts.columns = ['City', 'Stops']
-        st.bar_chart(city_counts.set_index('City'))
+        
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.write("### Total Stops per City")
+            city_counts = history['City_Clean'].value_counts().reset_index()
+            city_counts.columns = ['City', 'Stops']
+            st.bar_chart(city_counts.set_index('City'))
+            
+        with col_b:
+            st.write("### Total Gallons per City")
+            city_gals = history.groupby('City_Clean')['Ullage_Num'].sum().reset_index()
+            city_gals.columns = ['City', 'Gallons']
+            st.bar_chart(city_gals.set_index('City'))
+        
+        st.write("### Deliveries by Day")
+        st.table(history['Dispatch_Day'].value_counts())
         
         if st.button("Clear Memory Log"):
             os.remove(LOG_FILE)
             st.rerun()
     else:
-        st.info("Run a route to start tracking trends.")
+        st.info("No data in memory yet. Use the 'Finalize' button in the Dispatcher tab to start.")

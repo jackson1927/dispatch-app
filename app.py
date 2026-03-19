@@ -15,128 +15,110 @@ DEFAULT_ZONES = {
     "Friday": "ORLANDO, KISSIMMEE, LAKELAND, HAINES CITY, AUBURNDALE, CLERMONT"
 }
 
-st.set_page_config(page_title="Propane Dispatch AI", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Propane Dispatch AI", layout="wide")
+
+# --- AUTO-DETECTION ENGINE ---
+def find_col(df, keywords):
+    """Searches for columns that contain any of the keywords (case-insensitive)."""
+    for col in df.columns:
+        if any(key.lower() in str(col).lower() for key in keywords):
+            return col
+    return None
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("⚙️ Controls")
+    st.header("⚙️ Settings")
     max_stops = st.slider("Max Stops Per Truck", 5, 40, 22)
-    st.markdown("---")
-    st.subheader("🚚 Active Fleet")
     active_trucks = {name: cap for name, cap in TRUCKS.items() if st.checkbox(name, value=True)}
-    show_debug = st.checkbox("🛠️ Debug: Show Column Names")
+    st.markdown("---")
+    if st.button("🗑️ Reset Memory"):
+        if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
+        st.rerun()
 
 # --- APP TABS ---
-tab1, tab2, tab3 = st.tabs(["🎯 Dispatch Control", "⚖️ Route Comparison", "📈 Analytics"])
+tab1, tab2 = st.tabs(["🎯 Dispatcher", "📊 Zone Analysis"])
 
 with tab1:
-    st.title("🚚 Propane Dispatch Console")
+    st.title("🚚 Propane Dispatcher")
     
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.subheader("1. Data Input")
-        telemetry_file = st.file_uploader("Upload Otodata Export (CSV)", type="csv", key="main_upload")
-        
-    with col2:
-        st.subheader("2. Zone Management")
-        today_name = datetime.datetime.now().strftime("%A")
-        route_day = st.selectbox("Active Day", list(DEFAULT_ZONES.keys()), index=list(DEFAULT_ZONES.keys()).index(today_name))
-        current_zone_text = st.text_area("Edit Cities", value=DEFAULT_ZONES[route_day], height=70)
-        target_cities = [c.strip().upper() for c in current_zone_text.split(",") if c.strip()]
+    # 1. DATA INPUT
+    telemetry_file = st.file_uploader("Upload Otodata CSV", type="csv")
+    
+    # 2. ZONE SELECTION
+    today_name = datetime.datetime.now().strftime("%A")
+    route_day = st.selectbox("Select Route Day", list(DEFAULT_ZONES.keys()), index=list(DEFAULT_ZONES.keys()).index(today_name))
+    target_cities = [c.strip().upper() for c in st.text_area("Cities in Zone", DEFAULT_ZONES[route_day]).split(",") if c.strip()]
 
     if telemetry_file:
-        df = pd.read_csv(telemetry_file)
-        
-        def find_col(df, names):
-            for c in df.columns:
-                if any(n.lower() in str(c).lower() for n in names): return c
-            return None
+        # Load data with a fallback for weird encoding
+        try:
+            df = pd.read_csv(telemetry_file, encoding='utf-8')
+        except:
+            df = pd.read_csv(telemetry_file, encoding='latin1')
 
-        name_col = find_col(df, ["Name", "Customer", "Account"])
-        city_col = find_col(df, ["City", "Town", "Location"])
-        level_col = find_col(df, ["Level", "%", "Percent", "Value", "Reading", "Tank"]) 
+        # DETECT COLUMNS
+        name_col = find_col(df, ["Name", "Customer", "Account", "Asset"])
+        city_col = find_col(df, ["City", "Town", "Location", "Ship To"])
+        level_col = find_col(df, ["Level", "%", "Percent", "Reading"])
         ullage_col = find_col(df, ["Ullage", "Room", "Volume", "Fill"])
         dte_col = find_col(df, ["DTE", "Days to Empty", "Estimate"])
 
+        # VALIDATION
         if not name_col or not city_col:
-            st.error("❌ Missing Name or City columns.")
+            st.error(f"❌ Could not find Name or City columns. Found: {list(df.columns)}")
         else:
-            df['City_Clean'] = df[city_col].fillna("UNKNOWN").apply(lambda x: str(x).strip().upper())
-            df['DTE_Val'] = df[dte_col].apply(lambda x: int(re.findall(r'\d+', str(x))[0]) if re.findall(r'\d+', str(x)) else 999)
+            # CLEANING
+            df['City_Clean'] = df[city_col].fillna("UNKNOWN").astype(str).str.strip().upper()
             df['Ullage_Num'] = pd.to_numeric(df[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
-            df['Level_Disp'] = df[level_col].astype(str) if level_col else "N/A"
+            
+            # Smart DTE Parsing
+            def parse_dte(val):
+                nums = re.findall(r'\d+', str(val))
+                return int(nums[0]) if nums else 99
+            df['DTE_Val'] = df[dte_col].apply(parse_dte) if dte_col else 99
 
-            # --- AI ALLOCATION LOGIC ---
-            df['In_Zone'] = df['City_Clean'].apply(lambda x: any(t in x for t in target_cities))
-            pool = df[(df['In_Zone'] == True) | (df['DTE_Val'] <= 1)].copy()
-            pool['Score'] = pool.apply(lambda r: 1 if r['DTE_Val'] <= 1 else (2 if r['In_Zone'] and r['DTE_Val'] <= 4 else 3), axis=1)
+            # LOGIC
+            df['In_Zone'] = df['City_Clean'].apply(lambda x: any(target in x for target in target_cities))
+            pool = df[(df['In_Zone']) | (df['DTE_Val'] <= 2)].copy()
+            pool['Score'] = pool.apply(lambda r: 1 if r['DTE_Val'] <= 2 else 2, axis=1)
             sorted_pool = pool.sort_values(['Score', 'DTE_Val', 'Ullage_Num'], ascending=[True, True, False])
 
+            # ASSIGNMENT
             final_route_data = []
             temp_pool = sorted_pool.copy()
             for t_name, t_cap in active_trucks.items():
-                load, count = 0, 0
-                manifest_list = []
+                load, count, manifest = 0, 0, []
                 for idx, row in temp_pool.iterrows():
                     if (load + row['Ullage_Num'] <= t_cap) and (count < max_stops):
                         load += row['Ullage_Num']
                         count += 1
-                        r = row.copy()
-                        r['Assigned_Truck'] = t_name
-                        manifest_list.append(r)
+                        row_copy = row.copy()
+                        row_copy['Assigned_Truck'] = t_name
+                        manifest.append(row_copy)
                         temp_pool = temp_pool.drop(idx)
-                if manifest_list:
-                    final_route_data.append(pd.DataFrame(manifest_list))
+                if manifest:
+                    final_route_data.append(pd.DataFrame(manifest))
 
-            # --- DISPLAY AI ROUTES ---
+            # DISPLAY
             if final_route_data:
-                st.subheader("3. AI Generated Manifests")
-                m_cols = st.columns(len(active_trucks))
-                for i, (t_name, _) in enumerate(active_trucks.items()):
-                    with m_cols[i]:
-                        t_df_list = [d for d in final_route_data if d['Assigned_Truck'].iloc[0] == t_name]
-                        if t_df_list:
-                            t_df = t_df_list[0]
-                            st.success(f"**{t_name}**")
-                            st.dataframe(t_df[[name_col, city_col, 'Level_Disp', 'Ullage_Num']].sort_values(city_col), use_container_width=True, hide_index=True)
+                cols = st.columns(len(active_trucks))
+                for i, m_df in enumerate(final_route_data):
+                    t_name = m_df['Assigned_Truck'].iloc[0]
+                    with cols[i]:
+                        st.success(f"**{t_name}**")
+                        disp_cols = [name_col, city_col]
+                        if level_col: disp_cols.append(level_col)
+                        st.dataframe(m_df[disp_cols], hide_index=True)
+                
+                if st.button("✅ Finalize & Record", use_container_width=True):
+                    all_routes = pd.concat(final_route_data)
+                    all_routes['Dispatch_Day'] = route_day
+                    all_routes[['Dispatch_Day', 'City_Clean', 'Ullage_Num']].to_csv(LOG_FILE, mode='a', index=False, header=not os.path.exists(LOG_FILE))
+                    st.balloons()
 
 with tab2:
-    st.header("⚖️ AI vs. Manual Comparison")
-    st.write("Upload your manually planned route to see how it compares to the AI's efficiency.")
-    
-    manual_file = st.file_uploader("Upload Manual Route (CSV)", type="csv", key="manual_upload")
-    
-    if telemetry_file and manual_file:
-        m_df_raw = pd.read_csv(manual_file)
-        # Find matches in the master telemetry data based on Name
-        manual_names = m_df_raw[find_col(m_df_raw, ["Name", "Customer"])].tolist()
-        manual_route = df[df[name_col].isin(manual_names)].copy()
-        
-        # Calculate AI Stats
-        ai_all = pd.concat(final_route_data) if final_route_data else pd.DataFrame()
-        
-        c1, c2 = st.columns(2)
-        
-        with c1:
-            st.metric("AI Route Stops", len(ai_all))
-            st.metric("AI Zone Efficiency", f"{(ai_all['In_Zone'].mean()*100):.1f}% in zone")
-            st.write("**AI Stops:**")
-            st.dataframe(ai_all[[name_col, city_col]], hide_index=True)
-
-        with c2:
-            st.metric("Manual Route Stops", len(manual_route))
-            # Check zone adherence for manual route
-            manual_route['In_Zone'] = manual_route['City_Clean'].apply(lambda x: any(t in x for t in target_cities))
-            st.metric("Manual Zone Efficiency", f"{(manual_route['In_Zone'].mean()*100):.1f}% in zone")
-            st.write("**Manual Stops:**")
-            st.dataframe(manual_route[[name_col, city_col]], hide_index=True)
-            
-        st.info("💡 A higher 'Zone Efficiency' means fewer miles driven outside your primary service area for the day.")
-
-with tab3:
-    st.header("📊 Zone Performance Analysis")
-    if os.path.isfile(LOG_FILE):
+    if os.path.exists(LOG_FILE):
         history = pd.read_csv(LOG_FILE)
-        st.bar_chart(history['City_Clean'].value_counts())
+        st.bar_chart(history.groupby('City_Clean')['Ullage_Num'].count())
     else:
-        st.info("No memory data yet.")
+        st.info("No data yet.")

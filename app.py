@@ -69,38 +69,4 @@ with tab1:
             
             def score_efficiency(row):
                 if row['DTE_Val'] <= 1: return 1
-                if row['In_Zone'] and row['DTE_Val'] <= 4: return 2
-                return 3
-
-            pool['Score'] = pool.apply(score_efficiency, axis=1)
-            # Sort to get the most critical/efficient stops first
-            sorted_pool = pool.sort_values(['Score', 'DTE_Val', 'Ullage_Num'], ascending=[True, True, False])
-
-            # ALLOCATION
-            st.header(f"Manifests for {route_day}")
-            active_trucks = {name: cap for name, cap in TRUCKS.items() if st.sidebar.checkbox(name, value=True)}
-            
-            all_scheduled_stops = []
-
-            for t_name, t_cap in active_trucks.items():
-                load = 0
-                stop_count = 0
-                manifest = []
-                
-                for idx, row in sorted_pool.iterrows():
-                    # Check both Gallon Capacity AND Max Stop Count
-                    if (load + row['Ullage_Num'] <= t_cap) and (stop_count < max_stops):
-                        load += row['Ullage_Num']
-                        stop_count += 1
-                        row['Assigned_Truck'] = t_name
-                        row['Dispatch_Date'] = datetime.date.today()
-                        row['Dispatch_Day'] = route_day
-                        manifest.append(row)
-                        all_scheduled_stops.append(row)
-                        sorted_pool = sorted_pool.drop(idx)
-                
-                if manifest:
-                    m_df = pd.DataFrame(manifest)
-                    with st.expander(f"📖 {t_name} | {stop_count} Stops | {load:.0f} Gal", expanded=True):
-                        st.dataframe(m_df[[city_col, 'Ullage_Num', 'DTE_Val']].sort_values(city_col))
-                        st.download_button(f"Export {t_name}", m_df.to_csv(index
+                if row

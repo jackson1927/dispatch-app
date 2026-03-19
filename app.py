@@ -14,9 +14,9 @@ ZONES = {
 }
 
 st.set_page_config(page_title="Propane Auto-Dispatch Pro", layout="wide")
-st.title("🚚 Smart-Zone Dispatcher (DTO + DTE Aware)")
+st.title("🚚 Smart-Zone Dispatcher")
+st.markdown("**(DTO: Optimal Fill | DTE: Days to Empty)**")
 
-# --- HELPERS ---
 def find_column(df, possible_names):
     for col in df.columns:
         if any(name.lower() in str(col).lower() for name in possible_names):
@@ -44,7 +44,6 @@ with col2:
 
 if telemetry_file:
     df_tel = pd.read_csv(telemetry_file)
-    
     city_col = find_column(df_tel, ["City", "Town", "Location", "Ship To"])
     name_col = find_column(df_tel, ["Name", "Customer"])
     ullage_col = find_column(df_tel, ["Ullage", "Room", "Volume"])
@@ -52,39 +51,37 @@ if telemetry_file:
     dte_col = find_column(df_tel, ["DTE", "Days to Empty"])
 
     if not city_col:
-        st.error(f"❌ Error: 'City' column not found. Headers: {df_tel.columns.tolist()}")
+        st.error(f"❌ Error: 'City' column not found.")
     else:
         df_tel['City_Clean'] = df_tel[city_col].fillna("UNKNOWN").apply(lambda x: str(x).strip().upper())
         df_tel['DTO_Val'] = df_tel[dto_col].apply(get_days_num) if dto_col else 999
         df_tel['DTE_Val'] = df_tel[dte_col].apply(get_days_num) if dte_col else 999
         df_tel['Ullage_Num'] = pd.to_numeric(df_tel[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0) if ullage_col else 0
 
-        # --- DTO & DTE SCORING LOGIC ---
+        # --- UPDATED SCORING (Optimal vs Empty) ---
         def score_row(row):
             is_in_zone = any(target.upper() in row['City_Clean'] for target in target_cities)
             
-            # Priority 1: EMERGENCY (Out of gas or 1 day left)
-            if row['DTO_Val'] <= 1 or row['DTE_Val'] <= 1: return 1
+            # Priority 1: CRITICAL DANGER (DTE 0-1)
+            if row['DTE_Val'] <= 1: return 1
             
-            # Priority 2: ZONE STRATEGY (In today's zone and getting low)
-            if is_in_zone and (row['DTO_Val'] <= 4 or row['DTE_Val'] <= 4): return 2
+            # Priority 2: STRATEGIC ZONE (In Zone & DTO 0-2 or DTE < 4)
+            if is_in_zone and (row['DTO_Val'] <= 2 or row['DTE_Val'] <= 4): return 2
             
-            # Priority 3: BIG DROPS (In zone, plenty of room)
-            if is_in_zone and row['Ullage_Num'] > 200: return 3
+            # Priority 3: ZONE EFFICIENCY (In zone, big drop available)
+            if is_in_zone and row['Ullage_Num'] > 180: return 3
             
-            # Priority 4: OFF-ZONE LOW (DTE/DTO 2-3 but wrong area)
-            if row['DTO_Val'] <= 3 or row['DTE_Val'] <= 3: return 4
+            # Priority 4: OFF-ZONE LOW (DTE 2-3)
+            if row['DTE_Val'] <= 3: return 4
             
             return 5
 
         df_tel['Priority_Score'] = df_tel.apply(score_row, axis=1)
-        pool = df_tel[df_tel['Ullage_Num'] > 40].sort_values(['Priority_Score', 'DTO_Val', 'DTE_Val'], ascending=[True, True, True])
+        pool = df_tel[df_tel['Ullage_Num'] > 40].sort_values(['Priority_Score', 'DTE_Val', 'DTO_Val'], ascending=[True, True, True])
 
         # ALLOCATION
-        st.header(f"Smart Manifests: {route_day}")
-        final_output = []
         truck_list = {name: st.sidebar.number_input(f"{name} Cap", value=cap) for name, cap in TRUCKS.items() if st.sidebar.checkbox(name, value=True)}
-        
+        final_output = []
         for t_name, t_cap in truck_list.items():
             load = 0
             assigned_indices = []
@@ -102,7 +99,7 @@ if telemetry_file:
             for t_name in truck_list.keys():
                 t_df = res_df[res_df['Assigned_Truck'] == t_name]
                 if not t_df.empty:
-                    with st.expander(f"📋 {t_name} - {t_df['Ullage_Num'].sum():.0f} gal", expanded=True):
+                    with st.expander(f"📖 {t_name} - {t_df['Ullage_Num'].sum():.0f} gal", expanded=True):
                         disp = t_df[[name_col, city_col, 'Ullage_Num', 'DTO_Val', 'DTE_Val', 'Priority_Score']].sort_values(city_col)
                         st.dataframe(disp)
                         csv = t_df.to_csv(index=False).encode('utf-8')

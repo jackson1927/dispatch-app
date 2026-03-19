@@ -14,7 +14,7 @@ ZONES = {
 }
 
 st.set_page_config(page_title="Propane Auto-Dispatch Pro", layout="wide")
-st.title("🚚 Smart-Zone Dispatcher")
+st.title("🚚 Smart-Zone Dispatcher (DTO + DTE Aware)")
 
 # --- HELPERS ---
 def find_column(df, possible_names):
@@ -23,25 +23,17 @@ def find_column(df, possible_names):
             return col
     return None
 
-def get_dte_num(val):
+def get_days_num(val):
     val = str(val).lower()
-    if 'hour' in val or 'minute' in val or 'now' in val: return 0
+    if any(x in val for x in ['hour', 'minute', 'now', '0']): return 0
     nums = re.findall(r'\d+', val)
     return int(nums[0]) if nums else 999
-
-def clean_acct(val):
-    if pd.isna(val): return ""
-    match = re.search(r'(\d+)', str(val))
-    return match.group(1).lstrip('0') if match else ""
 
 # --- SIDEBAR ---
 st.sidebar.header("Route Settings")
 today_name = datetime.datetime.now().strftime("%A")
 route_day = st.sidebar.selectbox("Select Route Day", list(ZONES.keys()), index=list(ZONES.keys()).index(today_name))
 target_cities = ZONES[route_day]
-
-active_trucks = {name: st.sidebar.number_input(f"{name} Cap", value=cap) 
-                 for name, cap in TRUCKS.items() if st.sidebar.checkbox(name, value=True)}
 
 # --- FILE UPLOADS ---
 col1, col2 = st.columns(2)
@@ -54,60 +46,51 @@ if telemetry_file:
     df_tel = pd.read_csv(telemetry_file)
     
     city_col = find_column(df_tel, ["City", "Town", "Location", "Ship To"])
-    acct_col_tel = find_column(df_tel, ["Account", "Customer Number", "Acct"])
     name_col = find_column(df_tel, ["Name", "Customer"])
     ullage_col = find_column(df_tel, ["Ullage", "Room", "Volume"])
-    dte_col = find_column(df_tel, ["DTO", "DTE", "Days to Empty", "Days"])
+    dto_col = find_column(df_tel, ["DTO"])
+    dte_col = find_column(df_tel, ["DTE", "Days to Empty"])
 
     if not city_col:
         st.error(f"❌ Error: 'City' column not found. Headers: {df_tel.columns.tolist()}")
     else:
         df_tel['City_Clean'] = df_tel[city_col].fillna("UNKNOWN").apply(lambda x: str(x).strip().upper())
-        df_tel['DTE_Num'] = df_tel[dte_col].apply(get_dte_num) if dte_col else 999
+        df_tel['DTO_Val'] = df_tel[dto_col].apply(get_days_num) if dto_col else 999
+        df_tel['DTE_Val'] = df_tel[dte_col].apply(get_days_num) if dte_col else 999
         df_tel['Ullage_Num'] = pd.to_numeric(df_tel[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0) if ullage_col else 0
-        df_tel['Acct_Key'] = df_tel[acct_col_tel].apply(clean_acct) if acct_col_tel else ""
 
-        # Smart Drop Logic
-        if history_file:
-            df_hist = pd.read_csv(history_file)
-            acct_col_hist = find_column(df_hist, ["Account", "Acct"])
-            qty_cols = [c for c in df_hist.columns if 'qty' in c.lower()]
-            if acct_col_hist and qty_cols:
-                df_hist['Acct_Key'] = df_hist[acct_col_hist].apply(clean_acct)
-                df_hist['Avg_Drop'] = df_hist[qty_cols].replace(0, pd.NA).mean(axis=1).fillna(0)
-                hist_map = df_hist.groupby('Acct_Key')['Avg_Drop'].first()
-                df_tel['Planned_Gals'] = df_tel.apply(lambda x: min(x['Ullage_Num'], hist_map.get(x['Acct_Key'], x['Ullage_Num'])), axis=1)
-            else:
-                df_tel['Planned_Gals'] = df_tel['Ullage_Num']
-        else:
-            df_tel['Planned_Gals'] = df_tel['Ullage_Num']
-
-        # --- DTE & ZONE SCORING ---
+        # --- DTO & DTE SCORING LOGIC ---
         def score_row(row):
             is_in_zone = any(target.upper() in row['City_Clean'] for target in target_cities)
-            # Priority 1: Critical (DTE 0-1)
-            if row['DTE_Num'] <= 1: return 1
-            # Priority 2: In-Zone and getting low (DTE 2-4)
-            if is_in_zone and row['DTE_Num'] <= 4: return 2
-            # Priority 3: In-Zone Fill-up (Good drop size)
-            if is_in_zone and row['Planned_Gals'] > 175: return 3
-            # Priority 4: Out-of-Zone Critical (DTE 2-3)
-            if row['DTE_Num'] <= 3: return 4
+            
+            # Priority 1: EMERGENCY (Out of gas or 1 day left)
+            if row['DTO_Val'] <= 1 or row['DTE_Val'] <= 1: return 1
+            
+            # Priority 2: ZONE STRATEGY (In today's zone and getting low)
+            if is_in_zone and (row['DTO_Val'] <= 4 or row['DTE_Val'] <= 4): return 2
+            
+            # Priority 3: BIG DROPS (In zone, plenty of room)
+            if is_in_zone and row['Ullage_Num'] > 200: return 3
+            
+            # Priority 4: OFF-ZONE LOW (DTE/DTO 2-3 but wrong area)
+            if row['DTO_Val'] <= 3 or row['DTE_Val'] <= 3: return 4
+            
             return 5
 
         df_tel['Priority_Score'] = df_tel.apply(score_row, axis=1)
-        # Filter for anything that can take a 40gal+ drop
-        pool = df_tel[df_tel['Planned_Gals'] > 40].sort_values(['Priority_Score', 'DTE_Num', 'Planned_Gals'], ascending=[True, True, False])
+        pool = df_tel[df_tel['Ullage_Num'] > 40].sort_values(['Priority_Score', 'DTO_Val', 'DTE_Val'], ascending=[True, True, True])
 
         # ALLOCATION
-        st.header(f"Smart-Zone Routes: {route_day}")
+        st.header(f"Smart Manifests: {route_day}")
         final_output = []
-        for t_name, t_cap in active_trucks.items():
+        truck_list = {name: st.sidebar.number_input(f"{name} Cap", value=cap) for name, cap in TRUCKS.items() if st.sidebar.checkbox(name, value=True)}
+        
+        for t_name, t_cap in truck_list.items():
             load = 0
             assigned_indices = []
             for idx, row in pool.iterrows():
-                if load + row['Planned_Gals'] <= t_cap:
-                    load += row['Planned_Gals']
+                if load + row['Ullage_Num'] <= t_cap:
+                    load += row['Ullage_Num']
                     row_dict = row.to_dict()
                     row_dict['Assigned_Truck'] = t_name
                     final_output.append(row_dict)
@@ -116,12 +99,11 @@ if telemetry_file:
 
         if final_output:
             res_df = pd.DataFrame(final_output)
-            for t_name in active_trucks.keys():
+            for t_name in truck_list.keys():
                 t_df = res_df[res_df['Assigned_Truck'] == t_name]
                 if not t_df.empty:
-                    with st.expander(f"📖 {t_name} - {t_df['Planned_Gals'].sum():.0f} gal", expanded=True):
-                        # Sort display by City so the driver is efficient
-                        disp = t_df[[name_col, city_col, 'Planned_Gals', dte_col, 'Priority_Score']].sort_values(city_col)
+                    with st.expander(f"📋 {t_name} - {t_df['Ullage_Num'].sum():.0f} gal", expanded=True):
+                        disp = t_df[[name_col, city_col, 'Ullage_Num', 'DTO_Val', 'DTE_Val', 'Priority_Score']].sort_values(city_col)
                         st.dataframe(disp)
                         csv = t_df.to_csv(index=False).encode('utf-8')
-                        st.download_button(f"Download {t_name} CSV", csv, f"{t_name}_{route_day}.csv")
+                        st.download_button(f"Export {t_name} CSV", csv, f"{t_name}_{route_day}.csv")

@@ -24,6 +24,7 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("🚚 Active Fleet")
     active_trucks = {name: cap for name, cap in TRUCKS.items() if st.checkbox(name, value=True)}
+    show_debug = st.checkbox("🛠️ Debug: Show Column Names")
 
 # --- APP TABS ---
 tab1, tab2 = st.tabs(["🎯 Dispatch Control", "📈 Analytics"])
@@ -46,20 +47,26 @@ with tab1:
     if telemetry_file:
         df = pd.read_csv(telemetry_file)
         
+        # DEBUG: Helps us find the right name if it's missing
+        if show_debug:
+            st.write("### 🛠️ Found these columns in your file:")
+            st.write(list(df.columns))
+
         def find_col(df, names):
             for c in df.columns:
                 if any(n.lower() in str(c).lower() for n in names): return c
             return None
 
-        # Added "Level" and "Percent" to the search criteria
-        name_col = find_col(df, ["Name", "Customer", "Account Name"])
+        # BROADER SEARCH TERMS
+        name_col = find_col(df, ["Name", "Customer", "Account"])
         city_col = find_col(df, ["City", "Town", "Location"])
-        level_col = find_col(df, ["Level", "Percent", "Current %", "Tank Level"])
-        ullage_col = find_col(df, ["Ullage", "Room", "Volume"])
-        dte_col = find_col(df, ["DTE", "Days to Empty"])
+        # Expanded this list significantly to catch common Otodata variations
+        level_col = find_col(df, ["Level", "%", "Percent", "Value", "Reading", "Tank"]) 
+        ullage_col = find_col(df, ["Ullage", "Room", "Volume", "Fill"])
+        dte_col = find_col(df, ["DTE", "Days to Empty", "Estimate"])
 
         if not name_col or not city_col:
-            st.error("❌ Required columns (Name/City) missing. Check your CSV.")
+            st.error("❌ Required columns (Name/City) missing. Use 'Debug' in sidebar to check names.")
         else:
             # Data Cleaning
             df['City_Clean'] = df[city_col].fillna("UNKNOWN").apply(lambda x: str(x).strip().upper())
@@ -70,8 +77,12 @@ with tab1:
                 
             df['DTE_Val'] = df[dte_col].apply(safe_get_dte)
             df['Ullage_Num'] = pd.to_numeric(df[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
-            # Keeping the Level/Percent as a string for display (e.g., "15%")
-            df['Level_Disp'] = df[level_col].fillna("N/A") if level_col else "N/A"
+            
+            # IMPROVED LEVEL DISPLAY
+            if level_col:
+                df['Level_Disp'] = df[level_col].astype(str).apply(lambda x: x + "%" if "%" not in x else x)
+            else:
+                df['Level_Disp'] = "N/A"
 
             # --- POOLING & SCORING ---
             df['In_Zone'] = df['City_Clean'].apply(lambda x: any(t in x for t in target_cities))
@@ -113,3 +124,27 @@ with tab1:
                 
                 s1, s2, s3 = st.columns(3)
                 s1.metric("Scheduled Gallons", f"{total_gals:,.0f}")
+                s2.metric("Scheduled Stops", f"{total_stops}")
+                s3.metric("Pool Remaining", f"{len(temp_pool)}")
+
+                st.subheader("3. Daily Manifests")
+                m_cols = st.columns(len(active_trucks)) if active_trucks else st.columns(1)
+                
+                for i, (t_name, _) in enumerate(active_trucks.items()):
+                    with m_cols[i]:
+                        t_df_list = [d for d in final_route_data if d['Assigned_Truck'].iloc[0] == t_name]
+                        if t_df_list:
+                            t_df = t_df_list[0]
+                            st.success(f"**{t_name}**")
+                            # Displaying Name, City, Level, Ullage, DTE
+                            display_cols = [name_col, city_col, 'Level_Disp', 'Ullage_Num', dte_col]
+                            st.dataframe(t_df[display_cols].sort_values(city_col), use_container_width=True, hide_index=True)
+                            csv_data = t_df.to_csv(index=False).encode('utf-8')
+                            st.download_button(f"📥 Export {t_name}", csv_data, f"{t_name}.csv", key=f"dl_{t_name}")
+
+                if st.button("🚀 FINALIZE & RECORD ALL ROUTES", use_container_width=True):
+                    full_log = pd.concat(final_route_data)
+                    log_entry = full_log[['Dispatch_Date', 'Dispatch_Day', 'City_Clean', 'Ullage_Num']]
+                    if not os.path.isfile(LOG_FILE): log_entry.to_csv(LOG_FILE, index=False)
+                    else: log_entry.to_csv(LOG_FILE, mode='a', header=False, index=False)
+                    st.balloons()

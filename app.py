@@ -43,23 +43,16 @@ telemetry_file = st.file_uploader("Upload Otodata Export (CSV)", type="csv")
 if telemetry_file:
     df = pd.read_csv(telemetry_file)
     
-    # DIAGNOSTICS: Show headers if we fail
-    st.write("### 🔍 Checking File Headers...")
-    all_headers = df.columns.tolist()
-    
+    # DYNAMIC COLUMN MATCHING
     city_col = find_column(df, ["City", "Town", "Location", "Ship To"])
-    acct_col = find_column(df, ["Account", "Customer Number", "Acct"])
     name_col = find_column(df, ["Name", "Customer"])
     ullage_col = find_column(df, ["Ullage", "Room", "Volume"])
     dto_col = find_column(df, ["DTO", "Days to Empty", "Days"])
 
     if not city_col:
-        st.error(f"❌ Error: Could not find a 'City' column. Your file headers are: {all_headers}")
-        st.info("💡 Tip: Rename your city column to 'City' in your CSV and re-upload, or tell me the name above and I'll update the code!")
+        st.error(f"❌ Could not find a 'City' column. Headers found: {df.columns.tolist()}")
     else:
-        st.success(f"✅ Found data! Using '{city_col}' for City and '{ullage_col}' for Ullage.")
-        
-        # PROCESSING
+        # DATA CLEANING
         df['City_Clean'] = df[city_col].fillna("UNKNOWN").apply(lambda x: str(x).strip().upper())
         df['DTO_Num'] = df[dto_col].apply(get_dto_num) if dto_col else 999
         df['Ullage_Num'] = pd.to_numeric(df[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0) if ullage_col else 0
@@ -88,4 +81,15 @@ if telemetry_file:
                     row_dict['Assigned_Truck'] = t_name
                     final_output.append(row_dict)
                     assigned_indices.append(idx)
-            pool = pool.drop(
+            pool = pool.drop(assigned_indices)
+
+        if final_output:
+            res_df = pd.DataFrame(final_output)
+            for t_name in active_trucks.keys():
+                t_df = res_df[res_df['Assigned_Truck'] == t_name]
+                if not t_df.empty:
+                    with st.expander(f"📖 {t_name} Manifest - Total: {t_df['Ullage_Num'].sum():.0f} gal", expanded=True):
+                        display_cols = [c for c in [name_col, city_col, ullage_col, 'DTO'] if c]
+                        st.dataframe(t_df[display_cols].sort_values(city_col))
+                        csv = t_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(f"Download {t_name} CSV", csv, f"{t_name}_{route_day}.csv")

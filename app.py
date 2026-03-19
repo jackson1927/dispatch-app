@@ -24,80 +24,86 @@ def find_col(df, keywords):
             return col
     return None
 
-# --- MAIN APP LOGIC ---
-tab1, tab2, tab3 = st.tabs(["🎯 Dispatcher", "⚖️ Route Comparison", "📊 Zone Analysis"])
+# --- APP LAYOUT ---
+st.title("🚚 Propane Dispatch Console")
+
+tab1, tab2 = st.tabs(["🎯 Dispatcher & Comparison", "📊 Analytics"])
 
 with tab1:
-    st.title("🚚 Smart Dispatcher")
-    telemetry_file = st.file_uploader("Step 1: Upload Master Otodata CSV", type="csv")
+    col_input, col_zones = st.columns([1, 1])
     
-    # Zone Selection
-    route_day = st.selectbox("Select Active Route Day", list(DEFAULT_ZONES.keys()))
-    target_cities = [c.strip().upper() for c in st.text_area("Target Cities", DEFAULT_ZONES[route_day]).split(",") if c.strip()]
+    with col_input:
+        st.subheader("1. Upload Otodata CSV")
+        telemetry_file = st.file_uploader("Drop your Master Export here", type="csv")
+    
+    with col_zones:
+        st.subheader("2. Select Route Day")
+        route_day = st.selectbox("Day", list(DEFAULT_ZONES.keys()))
+        target_cities = [c.strip().upper() for c in st.text_area("Zone Cities", DEFAULT_ZONES[route_day]).split(",") if c.strip()]
 
     if telemetry_file:
-        df = pd.read_csv(telemetry_file, encoding='latin1')
-        
-        # Identify Columns
-        name_col = find_col(df, ["Name", "Customer", "Account"])
-        city_col = find_col(df, ["City", "Town", "Location"])
-        ullage_col = find_col(df, ["Ullage", "Room", "Volume"])
-        dte_col = find_col(df, ["DTE", "Days to Empty"])
+        # Load the file
+        try:
+            df = pd.read_csv(telemetry_file, encoding='latin1')
+            st.info(f"✅ File '{telemetry_file.name}' loaded successfully. Analyzing columns...")
+        except Exception as e:
+            st.error(f"❌ Error reading file: {e}")
+            df = None
 
-        if name_col and city_col:
-            # AI Logic (Simplified for brevity)
-            df['City_Clean'] = df[city_col].fillna("UNKNOWN").str.upper()
+        if df is not None:
+            # SEARCH FOR COLUMNS
+            name_col = find_col(df, ["Name", "Customer", "Account", "Asset"])
+            city_col = find_col(df, ["City", "Town", "Location", "Ship To"])
+            ullage_col = find_col(df, ["Ullage", "Room", "Volume", "Fill"])
+            dte_col = find_col(df, ["DTE", "Days to Empty", "Estimate"])
+            level_col = find_col(df, ["Level", "%", "Percent"])
+
+            # STATUS CHECKBOARD
+            st.write("### 🔍 Column Detection Status")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.markdown(f"**Name:** {'✅' if name_col else '❌'}")
+            c2.markdown(f"**City:** {'✅' if city_col else '❌'}")
+            c3.markdown(f"**Ullage:** {'✅' if ullage_col else '❌'}")
+            c4.markdown(f"**DTE:** {'✅' if dte_col else '❌'}")
+            c5.markdown(f"**Level %:** {'✅' if level_col else '❌'}")
+
+            if not name_col or not city_col:
+                st.warning("⚠️ Column Mismatch! The app can't find 'Name' or 'City'. Here are the columns I see in your file:")
+                st.write(list(df.columns))
+                st.stop() # Prevents the rest of the app from crashing
+
+            # DATA CLEANING
+            df['City_Clean'] = df[city_col].fillna("UNKNOWN").astype(str).str.upper()
             df['In_Zone'] = df['City_Clean'].apply(lambda x: any(t in x for t in target_cities))
+            
+            # Numeric conversion for Ullage
             df['Ullage_Num'] = pd.to_numeric(df[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
             
-            # Create AI Route
-            ai_pool = df[df['In_Zone'] | (df[dte_col].str.contains('0|1', na=False))].copy()
-            ai_route = ai_pool.head(22) # Simulating a single truck cap for comparison
+            # --- AI GENERATION ---
+            # Filter for "In Zone" or "Emergency (DTE 0-1)"
+            ai_pool = df[df['In_Zone'] | (df[dte_col].astype(str).str.contains('0|1', na=False))].copy()
             
-            st.success("AI Route Generated. Switch to 'Route Comparison' to compare against your manual list.")
-            st.dataframe(ai_route[[name_col, city_col, ullage_col]], hide_index=True)
-
-with tab2:
-    st.header("⚖️ AI vs. Manual Comparison")
-    st.info("Upload the CSV of the route you planned to run manually to see the efficiency difference.")
-    
-    manual_file = st.file_uploader("Step 2: Upload Your Manual Route CSV", type="csv")
-    
-    if telemetry_file and manual_file:
-        # Load Manual Data
-        m_df = pd.read_csv(manual_file, encoding='latin1')
-        m_name_col = find_col(m_df, ["Name", "Customer", "Account"])
-        
-        if m_name_col:
-            # Cross-reference Manual Names against Master Data to get City/Zone info
-            planned_names = m_df[m_name_col].unique()
-            manual_route_data = df[df[name_col].isin(planned_names)].copy()
-            
-            # CALCULATE STATS
-            ai_zone_hits = ai_route['In_Zone'].sum()
-            man_zone_hits = manual_route_data['In_Zone'].sum()
-            
-            # UI Comparison
-            col_a, col_b = st.columns(2)
-            
-            with col_a:
-                st.subheader("🤖 AI Suggested Route")
-                st.metric("Total Stops", len(ai_route))
-                st.metric("Zone Adherence", f"{(ai_zone_hits/len(ai_route)*100):.1f}%")
-                st.write("Stops inside defined zones.")
-                
-            with col_b:
-                st.subheader("📝 Your Manual Route")
-                st.metric("Total Stops", len(manual_route_data))
-                st.metric("Zone Adherence", f"{(man_zone_hits/len(manual_route_data)*100):.1f}%" if len(manual_route_data)>0 else "0%")
-                st.write("Stops outside defined zones (Out-of-route mileage).")
-
-            st.markdown("---")
-            st.write("### 🌍 Geographic Scatter")
-            if man_zone_hits < ai_zone_hits:
-                st.warning(f"The AI found {ai_zone_hits - man_zone_hits} more stops within your target zones than the manual route. This suggests the manual route may have high 'deadhead' mileage.")
+            st.divider()
+            st.subheader("3. AI Suggested Route")
+            if not ai_pool.empty:
+                st.dataframe(ai_pool[[name_col, city_col, ullage_col]].head(22), use_container_width=True)
             else:
-                st.success("Your manual route is highly efficient!")
+                st.info("No tanks matched the zone or emergency criteria.")
 
-with tab3:
-    st.write("Historical analysis appears here after finalizing.")
+            # --- COMPARISON SECTION ---
+            st.divider()
+            st.subheader("⚖️ Compare Against Manual Route")
+            manual_file = st.file_uploader("Upload your Manual Route CSV (Optional)", type="csv")
+            
+            if manual_file:
+                m_df = pd.read_csv(manual_file, encoding='latin1')
+                m_name_col = find_col(m_df, ["Name", "Customer", "Account"])
+                
+                if m_name_col:
+                    planned_names = m_df[m_name_col].unique()
+                    manual_route_data = df[df[name_col].isin(planned_names)].copy()
+                    
+                    mc1, mc2 = st.columns(2)
+                    mc1.metric("AI Route Efficiency", f"{(ai_pool['In_Zone'].mean()*100):.1f}% in zone")
+                    manual_efficiency = (manual_route_data['In_Zone'].mean()*100) if not manual_route_data.empty else 0
+                    mc2.metric("Manual Route Efficiency", f"{manual_efficiency:.1f}% in zone")

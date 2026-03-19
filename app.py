@@ -15,135 +15,142 @@ DEFAULT_ZONES = {
     "Friday": "ORLANDO, KISSIMMEE, LAKELAND, HAINES CITY, AUBURNDALE, CLERMONT"
 }
 
-st.set_page_config(page_title="Propane Dispatch AI", layout="wide")
+st.set_page_config(page_title="Propane Dispatch AI", layout="wide", initial_sidebar_state="expanded")
+
+# --- CUSTOM CSS FOR CLEAN LOOK ---
+st.markdown("""
+    <style>
+    .main { background-color: #f5f7f9; }
+    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #007bff; color: white; }
+    .zone-box { padding: 20px; border: 1px solid #e6e9ef; border-radius: 10px; background-color: white; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- SIDEBAR: SETTINGS ---
+with st.sidebar:
+    st.header("⚙️ Dispatch Settings")
+    max_stops = st.slider("Max Stops Per Truck", 5, 40, 22)
+    st.markdown("---")
+    st.subheader("🚚 Active Fleet")
+    active_trucks = {name: cap for name, cap in TRUCKS.items() if st.checkbox(name, value=True)}
+    st.markdown("---")
+    st.info("💡 Pro-Tip: Finalize routes at the end of the morning to save data to Memory.")
 
 # --- APP TABS ---
-tab1, tab2 = st.tabs(["🚛 Dispatcher", "📊 Zone Analysis (Memory)"])
+tab1, tab2 = st.tabs(["🎯 Dispatch Control", "📈 Analytics & Memory"])
 
 with tab1:
-    st.title("Smart-Zone Dispatcher")
+    # --- HEADER SECTION ---
+    st.title("🚚 Propane Dispatch Console")
     
-    # --- SIDEBAR: SETTINGS ---
-    st.sidebar.header("🛠️ Route Controls")
-    max_stops = st.sidebar.slider("Max Stops Per Truck", 5, 40, 22)
+    # --- ACTION AREA (UPPER) ---
+    col1, col2 = st.columns([1, 2])
     
-    st.sidebar.markdown("---")
-    st.sidebar.header("🗺️ Zone Manager")
-    current_zones = {}
-    for day, cities in DEFAULT_ZONES.items():
-        current_zones[day] = st.sidebar.text_area(f"{day} Cities", value=cities, height=68)
+    with col1:
+        st.subheader("1. Data Input")
+        telemetry_file = st.file_uploader("Upload Otodata Export (CSV)", type="csv", help="Upload the tank level report here.")
+        
+    with col2:
+        st.subheader("2. Zone Management")
+        today_name = datetime.datetime.now().strftime("%A")
+        route_day = st.selectbox("Active Day", list(DEFAULT_ZONES.keys()), index=list(DEFAULT_ZONES.keys()).index(today_name))
+        
+        # Compact Zone Editor
+        current_zone_text = st.text_area("Edit Cities for Today", value=DEFAULT_ZONES[route_day], height=70)
+        target_cities = [c.strip().upper() for c in current_zone_text.split(",") if c.strip()]
 
-    today_name = datetime.datetime.now().strftime("%A")
-    route_day = st.sidebar.selectbox("Select Active Route Day", list(current_zones.keys()), index=list(current_zones.keys()).index(today_name))
-    target_cities = [c.strip().upper() for c in current_zones[route_day].split(",") if c.strip()]
-
-    # --- HELPERS ---
-    def find_column(df, possible_names):
-        for col in df.columns:
-            if any(name.lower() in str(col).lower() for name in possible_names): return col
-        return None
-
-    def get_days_num(val):
-        val = str(val).lower()
-        if any(x in val for x in ['hour', 'minute', 'now', '0']): return 0
-        nums = re.findall(r'\d+', val)
-        return int(nums[0]) if nums else 999
-
-    # --- FILE UPLOAD ---
-    telemetry_file = st.file_uploader("Upload Otodata Tank Levels (CSV)", type="csv")
-
+    # --- PROCESSING ---
     if telemetry_file:
         df = pd.read_csv(telemetry_file)
-        city_col = find_column(df, ["City", "Town", "Location", "Ship To"])
-        ullage_col = find_column(df, ["Ullage", "Room", "Volume"])
-        dte_col = find_column(df, ["DTE", "Days to Empty"])
-        
+        # (Finding columns logic remains the same)
+        def find_col(df, names):
+            for c in df.columns:
+                if any(n.lower() in str(c).lower() for n in names): return c
+            return None
+
+        city_col = find_col(df, ["City", "Town", "Location"])
+        ullage_col = find_col(df, ["Ullage", "Room", "Volume"])
+        dte_col = find_col(df, ["DTE", "Days to Empty"])
+
         if city_col:
             df['City_Clean'] = df[city_col].fillna("UNKNOWN").apply(lambda x: str(x).strip().upper())
-            df['DTE_Val'] = df[dte_col].apply(get_days_num) if dte_col else 999
+            df['DTE_Val'] = df[dte_col].apply(lambda x: int(re.findall(r'\d+', str(x))[0]) if re.findall(r'\d+', str(x)) else 999)
             df['Ullage_Num'] = pd.to_numeric(df[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
 
-            # GEO-FENCE & SCORING
-            df['In_Zone'] = df['City_Clean'].apply(lambda x: any(target in x for target in target_cities))
-            pool = df[(df['In_Zone'] == True) | (df['DTE_Val'] <= 1)].copy()
-            
-            def score_efficiency(row):
-                if row['DTE_Val'] <= 1: return 1
-                if row['In_Zone'] and row['DTE_Val'] <= 4: return 2
-                return 3
-
-            pool['Score'] = pool.apply(score_efficiency, axis=1)
+            df['In_Zone'] = df['City_Clean'].apply(lambda x: any(t in x for t in target_cities))
+            pool = df[(df['In_Zone']) | (df['DTE_Val'] <= 1)].copy()
+            pool['Score'] = pool.apply(lambda r: 1 if r['DTE_Val'] <= 1 else (2 if r['In_Zone'] and r['DTE_Val'] <= 4 else 3), axis=1)
             sorted_pool = pool.sort_values(['Score', 'DTE_Val', 'Ullage_Num'], ascending=[True, True, False])
 
-            # ALLOCATION
-            st.header(f"Manifests for {route_day}")
-            active_trucks = {name: cap for name, cap in TRUCKS.items() if st.sidebar.checkbox(name, value=True)}
+            # --- STATS BAR ---
+            st.markdown("---")
+            stat_col1, stat_col2, stat_col3 = st.columns(3)
             
             final_route_data = []
+            assigned_total_gals = 0
+            assigned_total_stops = 0
 
+            # Pre-calculation for Stats
+            temp_pool = sorted_pool.copy()
             for t_name, t_cap in active_trucks.items():
-                load = 0
-                stop_count = 0
-                manifest = []
-                
-                for idx, row in sorted_pool.iterrows():
-                    if (load + row['Ullage_Num'] <= t_cap) and (stop_count < max_stops):
+                load, count = 0, 0
+                manifest_list = []
+                for idx, row in temp_pool.iterrows():
+                    if (load + row['Ullage_Num'] <= t_cap) and (count < max_stops):
                         load += row['Ullage_Num']
-                        stop_count += 1
-                        row_copy = row.copy()
-                        row_copy['Assigned_Truck'] = t_name
-                        manifest.append(row_copy)
-                        sorted_pool = sorted_pool.drop(idx)
-                
-                if manifest:
-                    m_df = pd.DataFrame(manifest)
-                    # Prepare data for memory logging later
+                        count += 1
+                        r = row.copy()
+                        r['Assigned_Truck'] = t_name
+                        manifest_list.append(r)
+                        temp_pool = temp_pool.drop(idx)
+                if manifest_list:
+                    m_df = pd.DataFrame(manifest_list)
                     m_df['Dispatch_Date'] = datetime.date.today()
                     m_df['Dispatch_Day'] = route_day
                     final_route_data.append(m_df)
-                    
-                    with st.expander(f"📖 {t_name} | {stop_count} Stops | {load:.0f} Gal", expanded=True):
-                        st.dataframe(m_df[[city_col, 'Ullage_Num', 'DTE_Val']].sort_values(city_col))
-                        csv_data = m_df.to_csv(index=False).encode('utf-8')
-                        st.download_button(label=f"Download {t_name} CSV", data=csv_data, file_name=f"{t_name}_{route_day}.csv")
+                    assigned_total_gals += load
+                    assigned_total_stops += count
 
-            # --- FINALIZATION BUTTON ---
+            stat_col1.metric("Total Scheduled Gallons", f"{assigned_total_gals:,.0f} gal")
+            stat_col2.metric("Total Stops", f"{assigned_total_stops}")
+            stat_col3.metric("Pool Remaining", f"{len(temp_pool)} tanks")
+
+            # --- MANIFEST DISPLAY ---
+            st.subheader("3. Daily Manifests")
+            m_cols = st.columns(len(active_trucks))
+            
+            for i, (t_name, t_cap) in enumerate(active_trucks.items()):
+                with m_cols[i]:
+                    # Find the specific dataframe for this truck
+                    t_df_list = [d for d in final_route_data if d['Assigned_Truck'].iloc[0] == t_name]
+                    if t_df_list:
+                        t_df = t_df_list[0]
+                        st.success(f"**{t_name}**")
+                        st.write(f"📈 {len(t_df)} stops | {t_df['Ullage_Num'].sum():.0f} gal")
+                        st.dataframe(t_df[[city_col, 'Ullage_Num', 'DTE_Val']].sort_values(city_col), use_container_width=True, hide_index=True)
+                        csv = t_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(f"📥 {t_name} CSV", csv, f"{t_name}.csv", key=t_name)
+                    else:
+                        st.warning(f"**{t_name}**\nNo stops assigned.")
+
+            # --- FINALIZE AREA ---
             st.markdown("---")
             if final_route_data:
-                if st.button("✅ Finalize & Record These Routes"):
+                if st.button("🚀 FINALIZE & RECORD ALL ROUTES"):
                     full_log = pd.concat(final_route_data)
                     log_entry = full_log[['Dispatch_Date', 'Dispatch_Day', 'City_Clean', 'Ullage_Num']]
-                    
-                    if not os.path.isfile(LOG_FILE):
-                        log_entry.to_csv(LOG_FILE, index=False)
-                    else:
-                        log_entry.to_csv(LOG_FILE, mode='a', header=False, index=False)
+                    if not os.path.isfile(LOG_FILE): log_entry.to_csv(LOG_FILE, index=False)
+                    else: log_entry.to_csv(LOG_FILE, mode='a', header=False, index=False)
                     st.balloons()
-                    st.success(f"Successfully recorded {len(full_log)} stops to Zone Analysis memory.")
 
+# --- TAB 2: ANALYSIS ---
 with tab2:
     st.header("📊 Zone Performance Analysis")
     if os.path.isfile(LOG_FILE):
         history = pd.read_csv(LOG_FILE)
-        
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.write("### Total Stops per City")
-            city_counts = history['City_Clean'].value_counts().reset_index()
-            city_counts.columns = ['City', 'Stops']
-            st.bar_chart(city_counts.set_index('City'))
-            
-        with col_b:
-            st.write("### Total Gallons per City")
-            city_gals = history.groupby('City_Clean')['Ullage_Num'].sum().reset_index()
-            city_gals.columns = ['City', 'Gallons']
-            st.bar_chart(city_gals.set_index('City'))
-        
-        st.write("### Deliveries by Day")
-        st.table(history['Dispatch_Day'].value_counts())
-        
-        if st.button("Clear Memory Log"):
-            os.remove(LOG_FILE)
-            st.rerun()
+        c1, c2 = st.columns(2)
+        with c1: st.bar_chart(history['City_Clean'].value_counts())
+        with c2: st.bar_chart(history.groupby('City_Clean')['Ullage_Num'].sum())
     else:
-        st.info("No data in memory yet. Use the 'Finalize' button in the Dispatcher tab to start.")
+        st.info("No data in memory.")

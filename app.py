@@ -23,14 +23,18 @@ tab1, tab2 = st.tabs(["🚛 Dispatcher", "📊 Zone Analysis (Memory)"])
 with tab1:
     st.title("Smart-Zone Dispatcher")
     
-    # --- SIDEBAR: ZONE MANAGER ---
+    # --- SIDEBAR: SETTINGS ---
+    st.sidebar.header("🛠️ Route Controls")
+    max_stops = st.sidebar.slider("Max Stops Per Truck", 5, 40, 22)
+    
+    st.sidebar.markdown("---")
     st.sidebar.header("🗺️ Zone Manager")
     current_zones = {}
     for day, cities in DEFAULT_ZONES.items():
         current_zones[day] = st.sidebar.text_area(f"{day} Cities", value=cities, height=68)
 
     today_name = datetime.datetime.now().strftime("%A")
-    route_day = st.sidebar.selectbox("Select Route Day", list(current_zones.keys()), index=list(current_zones.keys()).index(today_name))
+    route_day = st.sidebar.selectbox("Select Active Route Day", list(current_zones.keys()), index=list(current_zones.keys()).index(today_name))
     target_cities = [c.strip().upper() for c in current_zones[route_day].split(",") if c.strip()]
 
     # --- HELPERS ---
@@ -69,7 +73,8 @@ with tab1:
                 return 3
 
             pool['Score'] = pool.apply(score_efficiency, axis=1)
-            sorted_pool = pool.sort_values(['Score', 'DTE_Val'], ascending=[True, True])
+            # Sort to get the most critical/efficient stops first
+            sorted_pool = pool.sort_values(['Score', 'DTE_Val', 'Ullage_Num'], ascending=[True, True, False])
 
             # ALLOCATION
             st.header(f"Manifests for {route_day}")
@@ -79,10 +84,14 @@ with tab1:
 
             for t_name, t_cap in active_trucks.items():
                 load = 0
+                stop_count = 0
                 manifest = []
+                
                 for idx, row in sorted_pool.iterrows():
-                    if load + row['Ullage_Num'] <= t_cap:
+                    # Check both Gallon Capacity AND Max Stop Count
+                    if (load + row['Ullage_Num'] <= t_cap) and (stop_count < max_stops):
                         load += row['Ullage_Num']
+                        stop_count += 1
                         row['Assigned_Truck'] = t_name
                         row['Dispatch_Date'] = datetime.date.today()
                         row['Dispatch_Day'] = route_day
@@ -92,37 +101,6 @@ with tab1:
                 
                 if manifest:
                     m_df = pd.DataFrame(manifest)
-                    with st.expander(f"📖 {t_name} - {load:.0f} gal total", expanded=True):
+                    with st.expander(f"📖 {t_name} | {stop_count} Stops | {load:.0f} Gal", expanded=True):
                         st.dataframe(m_df[[city_col, 'Ullage_Num', 'DTE_Val']].sort_values(city_col))
-                        st.download_button(f"Export {t_name}", m_df.to_csv(index=False).encode('utf-8'), f"{t_name}.csv")
-
-            # --- THE MEMORY LOGGING ---
-            if all_scheduled_stops:
-                log_df = pd.DataFrame(all_scheduled_stops)
-                # Keep only what we need for analysis
-                log_entry = log_df[['Dispatch_Date', 'Dispatch_Day', 'City_Clean', 'Ullage_Num']]
-                
-                if not os.path.isfile(LOG_FILE):
-                    log_entry.to_csv(LOG_FILE, index=False)
-                else:
-                    log_entry.to_csv(LOG_FILE, mode='a', header=False, index=False)
-                st.success("📝 Memory Updated: Stops recorded for zone analysis.")
-
-with tab2:
-    st.header("📊 Zone Performance Analysis")
-    if os.path.isfile(LOG_FILE):
-        history = pd.read_csv(LOG_FILE)
-        st.write("### Total Stops by City (All Time)")
-        city_counts = history['City_Clean'].value_counts().reset_index()
-        city_counts.columns = ['City', 'Number of Deliveries']
-        st.bar_chart(city_counts.set_index('City'))
-        
-        st.write("### Deliveries by Day of Week")
-        day_counts = history['Dispatch_Day'].value_counts()
-        st.table(day_counts)
-        
-        if st.button("Clear Memory Log"):
-            os.remove(LOG_FILE)
-            st.warning("Memory cleared.")
-    else:
-        st.info("No data recorded yet. Upload an Otodata file and generate a route to start building the memory!")
+                        st.download_button(f"Export {t_name}", m_df.to_csv(index

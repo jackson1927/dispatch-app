@@ -1,102 +1,93 @@
 import streamlit as st
 import pandas as pd
 import re
-import io
+import datetime
 
 # --- CONFIGURATION ---
-TRUCKS = {
-    "Truck 225": 4160,
-    "Truck 224": 2800,
-    "Truck 108": 2240
+TRUCKS = {"Truck 225": 4160, "Truck 224": 2800, "Truck 108": 2240}
+
+# Your Specific Route Zones
+ZONES = {
+    "Monday": ["ANNA MARIA", "SARASOTA", "ST PETE", "ST. PETERSBURG", "TAMPA", "HOLMES BEACH", "BRADENTON BEACH"],
+    "Tuesday": ["LAKELAND", "HAINES CITY", "POLK CITY", "DAVENPORT", "WINTER HAVEN", "NEW PORT RICHEY", "TAMPA", "HUDSON"],
+    "Wednesday": ["TAMPA", "BRADENTON", "SARASOTA", "RUSKIN", "PALMETTO", "SUN CITY CENTER"],
+    "Thursday": ["TAMPA", "BRANDON", "PLANT CITY", "VALRICO"], # Clean up / Central
+    "Friday": ["ORLANDO", "KISSIMMEE", "LAKELAND", "HAINES CITY", "AUBURNDALE"]
 }
 
-st.set_page_config(page_title="Propane Auto-Dispatch", layout="wide")
-st.title("🚚 Propane Auto-Dispatch System")
-st.markdown("Upload your daily telemetry and delivery history to generate optimized routes.")
+st.set_page_config(page_title="Propane Auto-Dispatch Pro", layout="wide")
+st.title("🚚 Smart-Zone Dispatcher")
 
 # --- HELPERS ---
-def clean_acct(val):
-    if pd.isna(val): return ""
-    match = re.search(r'(\d+)', str(val))
-    return match.group(1).lstrip('0') if match else ""
+def clean_city(val):
+    return str(val).strip().upper()
 
-def parse_val(val):
-    try:
-        return float(str(val).replace(',', '').replace('gal', '').strip())
-    except:
-        return 0.0
+def get_dto_num(val):
+    val = str(val).lower()
+    if 'hour' in val or 'minute' in val: return 0
+    nums = re.findall(r'\d+', val)
+    return int(nums[0]) if nums else 999
 
-# --- SIDEBAR SETTINGS ---
-st.sidebar.header("Truck Availability")
-active_trucks = {}
-for name, cap in TRUCKS.items():
-    if st.sidebar.checkbox(name, value=True):
-        new_cap = st.sidebar.number_input(f"{name} Capacity", value=cap)
-        active_trucks[name] = new_cap
+# --- SIDEBAR ---
+st.sidebar.header("Route Settings")
+today_name = datetime.datetime.now().strftime("%A")
+route_day = st.sidebar.selectbox("Select Route Day", list(ZONES.keys()), index=list(ZONES.keys()).index(today_name))
+target_cities = ZONES[route_day]
+
+st.sidebar.markdown(f"**Targeting:** {', '.join(target_cities[:5])}...")
+
+active_trucks = {name: st.sidebar.number_input(f"{name} Cap", value=cap) 
+                 for name, cap in TRUCKS.items() if st.sidebar.checkbox(name, value=True)}
 
 # --- FILE UPLOADS ---
-col1, col2 = st.columns(2)
-with col1:
-    telemetry_file = st.file_uploader("Upload Otodata Export (CSV)", type="csv")
-with col2:
-    history_file = st.file_uploader("Upload Last 5 Deliveries (CSV)", type="csv")
+telemetry_file = st.file_uploader("Upload Otodata Export (CSV)", type="csv")
 
-if telemetry_file and history_file:
-    df_tel = pd.read_csv(telemetry_file)
-    df_hist = pd.read_csv(history_file)
+if telemetry_file:
+    df = pd.read_csv(telemetry_file)
+    df['City_Clean'] = df['City'].apply(clean_city)
+    df['DTO_Num'] = df['DTO'].apply(get_dto_num)
+    df['Ullage_Num'] = pd.to_numeric(df['Ullage'].str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
 
-    # Clean Data
-    df_tel['Acct_Key'] = df_tel['Account number'].apply(clean_acct)
-    df_hist['Acct_Key'] = df_hist['Account Number'].apply(clean_acct)
+    # SCORING LOGIC
+    def score_row(row):
+        # Emergency Priority
+        if row['DTO_Num'] <= 1: return 1 
+        # In-Zone & Needs Fuel
+        if row['City_Clean'] in target_cities and row['Ullage_Num'] > 150: return 2
+        # In-Zone Fill-up
+        if row['City_Clean'] in target_cities: return 3
+        # Out of Zone but low
+        if row['DTO_Num'] <= 3: return 4
+        return 5
+
+    df['Route_Priority'] = df.apply(score_row, axis=1)
     
-    # Calculate History Avg
-    qty_cols = ['qty1', 'qty2', 'qty3', 'qty4', 'qty5']
-    for col in qty_cols:
-        df_hist[col] = pd.to_numeric(df_hist[col], errors='coerce').fillna(0)
-    df_hist['Avg_Drop'] = df_hist[qty_cols].replace(0, pd.NA).mean(axis=1).fillna(0)
-    hist_lookup = df_hist.groupby('Acct_Key')['Avg_Drop'].first().reset_index()
-
-    # Merge and Logic
-    df_tel['Ullage_Val'] = df_tel['Ullage'].apply(parse_val)
-    master = pd.merge(df_tel, hist_lookup, on='Acct_Key', how='left')
-    
-    # Smart Ullage Logic
-    master['Planned_Gallons'] = master.apply(
-        lambda x: min(x['Ullage_Val'], x['Avg_Drop']) if x['Avg_Drop'] > 0 else x['Ullage_Val'], axis=1
-    )
-
-    # Priority Scoring (DTO 0-1 = High Priority)
-    def get_priority(dto_str):
-        dto_str = str(dto_str).lower()
-        if 'hour' in dto_str or 'minute' in dto_str: return 0
-        nums = re.findall(r'\d+', dto_str)
-        return int(nums[0]) if nums else 999
-
-    master['Priority'] = master['DTO'].apply(get_priority)
-    pool = master[master['Planned_Gallons'] > 30].sort_values(['Priority', 'Planned_Gallons'], ascending=[True, False])
+    # Filter out tanks that are too full to bother with
+    pool = df[df['Ullage_Num'] > 40].sort_values(['Route_Priority', 'Ullage_Num'], ascending=[True, False])
 
     # --- ALLOCATION ---
-    st.header("Generated Routes")
-    final_routes = []
+    st.header(f"Routes for {route_day}")
+    final_output = []
     
     for t_name, t_cap in active_trucks.items():
-        current_load = 0
-        assigned = []
+        load = 0
+        assigned_indices = []
         for idx, row in pool.iterrows():
-            if current_load + row['Planned_Gallons'] <= t_cap:
-                current_load += row['Planned_Gallons']
-                row['Assigned_Truck'] = t_name
-                final_routes.append(row)
-                assigned.append(idx)
-        pool = pool.drop(assigned)
+            if load + row['Ullage_Num'] <= t_cap:
+                load += row['Ullage_Num']
+                row_dict = row.to_dict()
+                row_dict['Assigned_Truck'] = t_name
+                final_output.append(row_dict)
+                assigned_indices.append(idx)
+        pool = pool.drop(assigned_indices)
 
-    if final_routes:
-        output_df = pd.DataFrame(final_routes)
+    if final_output:
+        res_df = pd.DataFrame(final_output)
         for t_name in active_trucks.keys():
-            t_route = output_df[output_df['Assigned_Truck'] == t_name]
-            st.subheader(f"{t_name} - {t_route['Planned_Gallons'].sum():.0f} Gallons")
-            st.dataframe(t_route[['Account number', 'Customer Name', 'City', 'Planned_Gallons', 'DTO']])
-            
-            # Download Button
-            csv = t_route.to_csv(index=False).encode('utf-8')
-            st.download_button(f"Download {t_name} Route", csv, f"{t_name}_route.csv", "text/csv")
+            t_df = res_df[res_df['Assigned_Truck'] == t_name]
+            with st.expander(f"📖 {t_name} Manifest - Total: {t_df['Ullage_Num'].sum():.0f} Gallons", expanded=True):
+                # Sort the manifest by City to keep the driver in one area
+                t_df = t_df.sort_values('City')
+                st.dataframe(t_df[['Customer Name', 'City', 'Ullage_Num', 'DTO', 'Route_Priority']])
+                csv = t_df.to_csv(index=False).encode('utf-8')
+                st.download_button(f"Download {t_name} CSV", csv, f"{t_name}_{route_day}.csv")

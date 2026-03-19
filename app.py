@@ -77,3 +77,89 @@ if telemetry_file:
             # --- COMBINE MANUAL + AI ---
             final_route_df = pd.DataFrame()
             if manual_file:
+                m_df = pd.read_csv(manual_file, encoding='latin1')
+                m_name_col = find_col(m_df, ["Name", "Customer"])
+                if m_name_col:
+                    manual_names = m_df[m_name_col].unique()
+                    final_route_df = df[df[name_col].isin(manual_names)].copy()
+                    if not final_route_df.empty:
+                        final_route_df['Source'] = 'Manual'
+
+            # Fill Capacity
+            total_cap = sum(active_trucks.values())
+            current_load = final_route_df['Ullage_Num'].sum() if not final_route_df.empty else 0
+            
+            # Exclude manual picks from the pool
+            manual_ids = final_route_df[name_col].tolist() if not final_route_df.empty else []
+            pool = df[~df[name_col].isin(manual_ids)]
+            pool = pool[pool['In_Zone'] | (pool['DTE_Num'] <= 2)].sort_values('DTE_Num')
+            
+            added = []
+            for _, row in pool.iterrows():
+                if current_load + row['Ullage_Num'] <= total_cap:
+                    row_copy = row.copy()
+                    row_copy['Source'] = 'AI Suggestion'
+                    added.append(row_copy)
+                    current_load += row['Ullage_Num']
+            
+            if added:
+                if not final_route_df.empty:
+                    final_route_df = pd.concat([final_route_df, pd.DataFrame(added)])
+                else:
+                    final_route_df = pd.DataFrame(added)
+
+            # --- MAP VIEW ---
+            if enable_geocoding and addr_col and not final_route_df.empty:
+                st.divider()
+                st.info("🛰️ Locating stops... this may take a moment.")
+                prog = st.progress(0)
+                lats, lons = [], []
+                for i, (idx, row) in enumerate(final_route_df.iterrows()):
+                    search = f"{row[addr_col]}, {row[city_col]}, FL"
+                    loc = geocode(search)
+                    lats.append(loc.latitude if loc else None)
+                    lons.append(loc.longitude if loc else None)
+                    prog.progress((i + 1) / len(final_route_df))
+                
+                final_route_df['lat'] = lats
+                final_route_df['lon'] = lons
+                st.map(final_route_df.dropna(subset=['lat', 'lon']))
+
+            # --- MANIFESTS ---
+            st.divider()
+            st.subheader("3. Truck Assignments")
+            t_cols = st.columns(len(active_trucks)) if active_trucks else st.columns(1)
+            temp_df = final_route_df.copy()
+            all_final = []
+
+            for i, (t_name, t_cap) in enumerate(active_trucks.items()):
+                t_load, t_list = 0, []
+                for idx, row in temp_df.iterrows():
+                    if (t_load + row['Ullage_Num'] <= t_cap) and (len(t_list) < max_stops):
+                        t_load += row['Ullage_Num']
+                        r = row.copy()
+                        r['Assigned_Truck'] = t_name
+                        t_list.append(r)
+                        all_final.append(r)
+                        temp_df = temp_df.drop(idx)
+                
+                with t_cols[i]:
+                    if t_list:
+                        m_df = pd.DataFrame(t_list)
+                        st.success(f"**{t_name}** ({t_load:.0f} gal)")
+                        st.dataframe(m_df[[name_col, city_col, 'Level_Disp', 'Source']], hide_index=True)
+                        st.download_button(f"📥 {t_name} CSV", m_df.to_csv(index=False), f"{t_name}.csv", key=f"dl_{t_name}")
+
+            # --- MASTER EXPORT ---
+            if all_final:
+                st.divider()
+                master_df = pd.DataFrame(all_final)
+                master_csv = master_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 DOWNLOAD MASTER DISPATCH LIST", master_csv, f"Master_{route_day}.csv", use_container_width=True)
+
+        else:
+            st.error("❌ Could not find Name or City columns in the CSV.")
+    except Exception as e:
+        st.error(f"❌ Error during processing: {e}")
+else:
+    st.info("👋 Upload an Otodata CSV to begin.")

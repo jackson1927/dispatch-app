@@ -98,20 +98,52 @@ with tab1:
                 st.map(optimized_pool.dropna(subset=['lat', 'lon']))
             
             # --- MANIFESTS ---
+           # --- MANIFESTS & MASTER EXPORT ---
+            st.divider()
             st.subheader("3. Final Truck Manifests")
+            
             t_cols = st.columns(len(active_trucks))
             temp_df = optimized_pool.copy()
+            all_assigned_data = [] # To hold data for the Master Export
 
             for i, (t_name, t_cap) in enumerate(active_trucks.items()):
                 t_load, t_manifest = 0, []
                 for idx, row in temp_df.iterrows():
                     if t_load + row['Ullage_Num'] <= t_cap:
                         t_load += row['Ullage_Num']
-                        t_manifest.append(row)
+                        row_with_truck = row.copy()
+                        row_with_truck['Assigned_Truck'] = t_name
+                        t_manifest.append(row_with_truck)
+                        all_assigned_data.append(row_with_truck)
                         temp_df = temp_df.drop(idx)
                 
                 with t_cols[i]:
                     if t_manifest:
                         m_df = pd.DataFrame(t_manifest)
                         st.success(f"**{t_name}** ({t_load:.0f} gal)")
+                        # Show Name, City, and Address in the UI
                         st.dataframe(m_df[[name_col, city_col, addr_col]], hide_index=True)
+                        st.download_button(f"📥 {t_name} CSV", m_df.to_csv(index=False), f"{t_name}.csv", key=f"dl_{t_name}")
+                    else:
+                        st.warning(f"**{t_name}** is empty.")
+
+            # --- FINAL MASTER EXPORT ---
+            if all_assigned_data:
+                st.divider()
+                st.subheader("4. Finalize & Export All")
+                master_df = pd.DataFrame(all_assigned_data)
+                
+                col_ex1, col_ex2 = st.columns([2, 1])
+                with col_ex1:
+                    st.write(f"The combined route for **{route_day}** is ready. This file includes all trucks in one list.")
+                with col_ex2:
+                    csv_master = master_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="📥 Download Master Route (CSV)",
+                        data=csv_master,
+                        file_name=f"Master_Dispatch_{route_day}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+        else:
+            st.error("Could not find Name or City columns. Check your file headers.")

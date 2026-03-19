@@ -3,24 +3,38 @@ import pandas as pd
 import re
 import datetime
 
-# --- CONFIGURATION ---
-TRUCKS = {"Truck 225": 4160, "Truck 224": 2800, "Truck 108": 2240}
-ZONES = {
-    "Monday": ["ANNA MARIA", "SARASOTA", "ST PETE", "ST. PETERSBURG", "TAMPA", "HOLMES BEACH", "BRADENTON BEACH"],
-    "Tuesday": ["LAKELAND", "HAINES CITY", "POLK CITY", "DAVENPORT", "WINTER HAVEN", "NEW PORT RICHEY", "TAMPA", "HUDSON"],
-    "Wednesday": ["TAMPA", "BRADENTON", "SARASOTA", "RUSKIN", "PALMETTO", "SUN CITY CENTER"],
-    "Thursday": ["TAMPA", "BRANDON", "PLANT CITY", "VALRICO", "RIVERVIEW"],
-    "Friday": ["ORLANDO", "KISSIMMEE", "LAKELAND", "HAINES CITY", "AUBURNDALE"]
+# --- DEFAULT CONFIG (You can change these in the app UI now!) ---
+DEFAULT_ZONES = {
+    "Monday": "ANNA MARIA, SARASOTA, ST PETE, HOLMES BEACH, BRADENTON BEACH, LONGBOAT KEY",
+    "Tuesday": "LAKELAND, HAINES CITY, POLK CITY, DAVENPORT, WINTER HAVEN, NEW PORT RICHEY, TAMPA, HUDSON, ALVA",
+    "Wednesday": "TAMPA, BRADENTON, SARASOTA, RUSKIN, PALMETTO, SUN CITY CENTER, PARRISH",
+    "Thursday": "TAMPA, BRANDON, PLANT CITY, VALRICO, RIVERVIEW, SEFFNER, DOVER",
+    "Friday": "ORLANDO, KISSIMMEE, LAKELAND, HAINES CITY, AUBURNDALE, CLERMONT"
 }
 
-st.set_page_config(page_title="Propane Auto-Dispatch Pro", layout="wide")
-st.title("🚚 Smart-Zone Dispatcher")
-st.markdown("**(DTO: Optimal Fill | DTE: Days to Empty)**")
+TRUCKS = {"Truck 225": 4160, "Truck 224": 2800, "Truck 108": 2240}
 
+st.set_page_config(page_title="Propane Dispatch Pro", layout="wide")
+st.title("🚚 Dynamic Zone Dispatcher")
+
+# --- SIDEBAR: ZONE MANAGER ---
+st.sidebar.header("🗺️ Zone Manager")
+st.sidebar.info("Edit cities below (separate by commas). The app will prioritize these for the selected day.")
+
+current_zones = {}
+for day, cities in DEFAULT_ZONES.items():
+    current_zones[day] = st.sidebar.text_area(f"{day} Cities", value=cities, height=68)
+
+today_name = datetime.datetime.now().strftime("%A")
+route_day = st.sidebar.selectbox("Select Active Route Day", list(current_zones.keys()), index=list(current_zones.keys()).index(today_name))
+
+# Convert the text area input into a clean list of uppercase cities
+target_cities = [c.strip().upper() for c in current_zones[route_day].split(",") if c.strip()]
+
+# --- HELPERS ---
 def find_column(df, possible_names):
     for col in df.columns:
-        if any(name.lower() in str(col).lower() for name in possible_names):
-            return col
+        if any(name.lower() in str(col).lower() for name in possible_names): return col
     return None
 
 def get_days_num(val):
@@ -29,78 +43,59 @@ def get_days_num(val):
     nums = re.findall(r'\d+', val)
     return int(nums[0]) if nums else 999
 
-# --- SIDEBAR ---
-st.sidebar.header("Route Settings")
-today_name = datetime.datetime.now().strftime("%A")
-route_day = st.sidebar.selectbox("Select Route Day", list(ZONES.keys()), index=list(ZONES.keys()).index(today_name))
-target_cities = ZONES[route_day]
-
-# --- FILE UPLOADS ---
-col1, col2 = st.columns(2)
-with col1:
-    telemetry_file = st.file_uploader("1. Upload Otodata Tank Levels (CSV)", type="csv")
-with col2:
-    history_file = st.file_uploader("2. Upload Delivery History (CSV) - Optional", type="csv")
+# --- FILE UPLOAD ---
+telemetry_file = st.file_uploader("Upload Otodata Tank Levels (CSV)", type="csv")
 
 if telemetry_file:
-    df_tel = pd.read_csv(telemetry_file)
-    city_col = find_column(df_tel, ["City", "Town", "Location", "Ship To"])
-    name_col = find_column(df_tel, ["Name", "Customer"])
-    ullage_col = find_column(df_tel, ["Ullage", "Room", "Volume"])
-    dto_col = find_column(df_tel, ["DTO"])
-    dte_col = find_column(df_tel, ["DTE", "Days to Empty"])
+    df = pd.read_csv(telemetry_file)
+    city_col = find_column(df, ["City", "Town", "Location", "Ship To"])
+    ullage_col = find_column(df, ["Ullage", "Room", "Volume"])
+    dte_col = find_column(df, ["DTE", "Days to Empty"])
+    dto_col = find_column(df, ["DTO"])
 
     if not city_col:
-        st.error(f"❌ Error: 'City' column not found.")
+        st.error("❌ City column missing in CSV.")
     else:
-        df_tel['City_Clean'] = df_tel[city_col].fillna("UNKNOWN").apply(lambda x: str(x).strip().upper())
-        df_tel['DTO_Val'] = df_tel[dto_col].apply(get_days_num) if dto_col else 999
-        df_tel['DTE_Val'] = df_tel[dte_col].apply(get_days_num) if dte_col else 999
-        df_tel['Ullage_Num'] = pd.to_numeric(df_tel[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0) if ullage_col else 0
+        # Data Cleaning
+        df['City_Clean'] = df[city_col].fillna("UNKNOWN").apply(lambda x: str(x).strip().upper())
+        df['DTE_Val'] = df[dte_col].apply(get_days_num) if dte_col else 999
+        df['DTO_Val'] = df[dto_col].apply(get_days_num) if dto_col else 999
+        df['Ullage_Num'] = pd.to_numeric(df[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
 
-        # --- UPDATED SCORING (Optimal vs Empty) ---
-        def score_row(row):
-            is_in_zone = any(target.upper() in row['City_Clean'] for target in target_cities)
-            
-            # Priority 1: CRITICAL DANGER (DTE 0-1)
-            if row['DTE_Val'] <= 1: return 1
-            
-            # Priority 2: STRATEGIC ZONE (In Zone & DTO 0-2 or DTE < 4)
-            if is_in_zone and (row['DTO_Val'] <= 2 or row['DTE_Val'] <= 4): return 2
-            
-            # Priority 3: ZONE EFFICIENCY (In zone, big drop available)
-            if is_in_zone and row['Ullage_Num'] > 180: return 3
-            
-            # Priority 4: OFF-ZONE LOW (DTE 2-3)
-            if row['DTE_Val'] <= 3: return 4
-            
-            return 5
+        # --- GEO-FENCE & SCORING ---
+        # Logic: Is the city in the text box for the selected day?
+        df['In_Zone'] = df['City_Clean'].apply(lambda x: any(target in x for target in target_cities))
+        
+        # Only process people IN ZONE or DTE 0/1 (Emergencies)
+        pool = df[(df['In_Zone'] == True) | (df['DTE_Val'] <= 1)].copy()
+        
+        def score_efficiency(row):
+            if row['DTE_Val'] <= 1: return 1  # Emergency (Anywhere)
+            if row['In_Zone'] and row['DTE_Val'] <= 4: return 2 # Priority Zone Low
+            if row['In_Zone'] and row['Ullage_Num'] > 150: return 3 # Zone Fill-up
+            return 4
 
-        df_tel['Priority_Score'] = df_tel.apply(score_row, axis=1)
-        pool = df_tel[df_tel['Ullage_Num'] > 40].sort_values(['Priority_Score', 'DTE_Val', 'DTO_Val'], ascending=[True, True, True])
+        pool['Score'] = pool.apply(score_efficiency, axis=1)
+        sorted_pool = pool.sort_values(['Score', 'DTE_Val'], ascending=[True, True])
 
-        # ALLOCATION
-        truck_list = {name: st.sidebar.number_input(f"{name} Cap", value=cap) for name, cap in TRUCKS.items() if st.sidebar.checkbox(name, value=True)}
-        final_output = []
-        for t_name, t_cap in truck_list.items():
+        # --- ALLOCATION ---
+        st.header(f"Manifests for {route_day}")
+        st.write(f"**Target Cities:** {', '.join(target_cities)}")
+        
+        active_trucks = {name: cap for name, cap in TRUCKS.items() if st.sidebar.checkbox(name, value=True)}
+        
+        for t_name, t_cap in active_trucks.items():
             load = 0
-            assigned_indices = []
-            for idx, row in pool.iterrows():
+            manifest = []
+            for idx, row in sorted_pool.iterrows():
                 if load + row['Ullage_Num'] <= t_cap:
                     load += row['Ullage_Num']
-                    row_dict = row.to_dict()
-                    row_dict['Assigned_Truck'] = t_name
-                    final_output.append(row_dict)
-                    assigned_indices.append(idx)
-            pool = pool.drop(assigned_indices)
-
-        if final_output:
-            res_df = pd.DataFrame(final_output)
-            for t_name in truck_list.keys():
-                t_df = res_df[res_df['Assigned_Truck'] == t_name]
-                if not t_df.empty:
-                    with st.expander(f"📖 {t_name} - {t_df['Ullage_Num'].sum():.0f} gal", expanded=True):
-                        disp = t_df[[name_col, city_col, 'Ullage_Num', 'DTO_Val', 'DTE_Val', 'Priority_Score']].sort_values(city_col)
-                        st.dataframe(disp)
-                        csv = t_df.to_csv(index=False).encode('utf-8')
-                        st.download_button(f"Export {t_name} CSV", csv, f"{t_name}_{route_day}.csv")
+                    manifest.append(row)
+                    sorted_pool = sorted_pool.drop(idx)
+            
+            if manifest:
+                m_df = pd.DataFrame(manifest)
+                with st.expander(f"📖 {t_name} - {load:.0f} gal total", expanded=True):
+                    # Sort display by city to keep driver grouped
+                    st.dataframe(m_df[[city_col, 'Ullage_Num', 'DTE_Val', 'DTO_Val', 'Score']].sort_values(city_col))
+                    st.download_button(f"Export {t_name} CSV", m_df.to_csv(index=False).encode('utf-8'), f"{t_name}.csv")

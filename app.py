@@ -3,6 +3,8 @@ import pandas as pd
 import re
 import datetime
 import os
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
 # --- CONFIGURATION ---
 LOG_FILE = "dispatch_memory_log.csv"
@@ -17,104 +19,91 @@ DEFAULT_ZONES = {
 
 st.set_page_config(page_title="Propane AI Optimizer", layout="wide")
 
+# Initialize Geocoder
+geolocator = Nominatim(user_agent="propane_dispatch_pc")
+geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
+
 def find_col(df, keywords):
     for col in df.columns:
         if any(key.lower() in str(col).lower() for key in keywords):
             return col
     return None
 
-# --- SIDEBAR: FLEET MANAGEMENT ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("🚛 Fleet Management")
-    st.write("Select trucks available for today's route:")
-    active_trucks = {}
-    for t_name, t_cap in TRUCKS_MASTER.items():
-        if st.checkbox(t_name, value=True, key=f"check_{t_name}"):
-            active_trucks[t_name] = t_cap
-    
+    active_trucks = {t: c for t, c in TRUCKS_MASTER.items() if st.checkbox(t, value=True)}
     st.markdown("---")
-    max_stops = st.slider("Max Stops per Truck", 10, 40, 22)
+    enable_geocoding = st.toggle("🛰️ Enable Address Lookup", value=True, help="Slows down upload but enables precise mapping.")
 
-st.title("🚀 Propane Route Optimizer & Map")
+st.title("🚀 Propane Route Optimizer")
 
 tab1, tab2 = st.tabs(["🎯 Route Builder", "📊 Zone Analysis"])
 
 with tab1:
-    col_input, col_zones = st.columns([1, 1])
-    with col_input:
-        st.subheader("1. Data Input")
+    col_in, col_zn = st.columns(2)
+    with col_in:
         telemetry_file = st.file_uploader("Upload Master Otodata CSV", type="csv")
-        manual_file = st.file_uploader("Upload Your Current Plan (Optional)", type="csv")
-    
-    with col_zones:
-        st.subheader("2. Target Zones")
-        route_day = st.selectbox("Active Day", list(DEFAULT_ZONES.keys()))
-        target_cities = [c.strip().upper() for c in st.text_area("Zone Cities", DEFAULT_ZONES[route_day]).split(",") if c.strip()]
+    with col_zn:
+        route_day = st.selectbox("Day", list(DEFAULT_ZONES.keys()))
+        target_cities = [c.strip().upper() for c in st.text_area("Zones", DEFAULT_ZONES[route_day]).split(",") if c.strip()]
 
     if telemetry_file:
-        try:
-            df = pd.read_csv(telemetry_file, encoding='latin1')
-            
-            # --- IDENTIFY COLUMNS ---
-            name_col = find_col(df, ["Asset", "Name", "Customer"])
-            city_col = find_col(df, ["City", "Town", "Location"])
-            level_col = find_col(df, ["Level", "%", "Percent"])
-            ullage_col = find_col(df, ["Ullage", "Room", "Volume"])
-            dte_col = find_col(df, ["DTE", "Days", "Empty"])
-            lat_col = find_col(df, ["Lat"])
-            lon_col = find_col(df, ["Lon", "Lng"])
+        df = pd.read_csv(telemetry_file, encoding='latin1')
+        
+        # Identify Columns
+        name_col = find_col(df, ["Asset", "Name", "Customer"])
+        city_col = find_col(df, ["City", "Town", "Location"])
+        addr_col = find_col(df, ["Address", "Street", "Ship To"])
+        ullage_col = find_col(df, ["Ullage", "Room", "Volume"])
+        lat_col, lon_col = find_col(df, ["Lat"]), find_col(df, ["Lon", "Lng"])
 
-            # --- CLEANING & SCORING ---
+        if name_col and city_col:
             df['City_Clean'] = df[city_col].fillna("UNKNOWN").astype(str).str.upper()
             df['In_Zone'] = df['City_Clean'].apply(lambda x: any(t in x for t in target_cities))
             df['Ullage_Num'] = pd.to_numeric(df[ullage_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(200)
-            df['DTE_Num'] = pd.to_numeric(df[dte_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(99)
-            
-            # --- COMBINE MANUAL + AI ---
-            final_route_df = pd.DataFrame()
-            if manual_file:
-                m_df = pd.read_csv(manual_file, encoding='latin1')
-                m_name_col = find_col(m_df, ["Name", "Customer"])
-                if m_name_col:
-                    manual_names = m_df[m_name_col].unique()
-                    final_route_df = df[df[name_col].isin(manual_names)].copy()
-                    final_route_df['Source'] = 'Manual'
 
-            # Fill remaining capacity
-            total_cap = sum(active_trucks.values())
-            current_load = final_route_df['Ullage_Num'].sum() if not final_route_df.empty else 0
-            
-            pool = df[~df[name_col].isin(final_route_df[name_col] if not final_route_df.empty else [])]
-            pool = pool[pool['In_Zone'] | (pool['DTE_Num'] <= 2)].sort_values('DTE_Num')
-            
-            added = []
-            for _, row in pool.iterrows():
-                if current_load + row['Ullage_Num'] <= total_cap:
-                    row['Source'] = 'AI Suggestion'
-                    added.append(row)
-                    current_load += row['Ullage_Num']
-            
-            if added:
-                final_route_df = pd.concat([final_route_df, pd.DataFrame(added)])
+            # --- SELECTION LOGIC ---
+            # We filter for high priority or in-zone
+            optimized_pool = df[df['In_Zone']].copy().head(60) # Capping at 60 for speed
+
+            # --- GEOCODING LOGIC ---
+            if enable_geocoding and addr_col:
+                st.info("🛰️ Locating customers via Street Address... please wait.")
+                progress_bar = st.progress(0)
+                
+                lats, lons = [], []
+                for i, row in optimized_pool.iterrows():
+                    # Create search string: "123 Main St, Plant City, FL"
+                    search_query = f"{row[addr_col]}, {row[city_col]}, FL"
+                    location = geocode(search_query)
+                    
+                    if location:
+                        lats.append(location.latitude)
+                        lons.append(location.longitude)
+                    else:
+                        lats.append(None)
+                        lons.append(None)
+                    
+                    progress_bar.progress((len(lats) / len(optimized_pool)))
+                
+                optimized_pool['lat'] = lats
+                optimized_pool['lon'] = lons
+                st.success("✅ Map data generated.")
 
             # --- MAP VIEW ---
             st.divider()
-            st.subheader("🗺️ Visual Route Map")
-            if lat_col and lon_col:
-                map_df = final_route_df.dropna(subset=[lat_col, lon_col]).rename(columns={lat_col: 'lat', lon_col: 'lon'})
-                st.map(map_df)
-                st.caption("Blue dots represent your combined optimized route.")
-            else:
-                st.warning("No Latitude/Longitude found in file. Map disabled.")
-
-            # --- TRUCK MANIFESTS ---
-            st.subheader("3. Optimized Manifests")
+            if 'lat' in optimized_pool.columns:
+                st.subheader("🗺️ Geographic Route View")
+                st.map(optimized_pool.dropna(subset=['lat', 'lon']))
+            
+            # --- MANIFESTS ---
+            st.subheader("3. Final Truck Manifests")
             t_cols = st.columns(len(active_trucks))
-            temp_df = final_route_df.copy()
+            temp_df = optimized_pool.copy()
 
             for i, (t_name, t_cap) in enumerate(active_trucks.items()):
-                t_manifest = []
-                t_load = 0
+                t_load, t_manifest = 0, []
                 for idx, row in temp_df.iterrows():
                     if t_load + row['Ullage_Num'] <= t_cap:
                         t_load += row['Ullage_Num']
@@ -125,8 +114,4 @@ with tab1:
                     if t_manifest:
                         m_df = pd.DataFrame(t_manifest)
                         st.success(f"**{t_name}** ({t_load:.0f} gal)")
-                        st.dataframe(m_df[[name_col, city_col, 'Source']], hide_index=True)
-                        st.download_button(f"📥 {t_name} CSV", m_df.to_csv(index=False), f"{t_name}.csv")
-
-        except Exception as e:
-            st.error(f"Error: {e}")
+                        st.dataframe(m_df[[name_col, city_col, addr_col]], hide_index=True)

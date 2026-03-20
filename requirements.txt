@@ -3,3 +3,5 @@ pandas
 geopy
 scikit-learn
 numpy
+requests
+openpyxl

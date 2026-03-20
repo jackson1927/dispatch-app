@@ -6,6 +6,8 @@ import hashlib
 import json
 import numpy as np
 
+import requests
+import base64
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 from sklearn.cluster import KMeans
@@ -52,6 +54,8 @@ TRUCK_ZONE_SLOTS = {
 SLOT_B_FALLBACK = "Truck 108"
 GEOCODE_CACHE_FILE = "geocode_cache.json"
 ZONE_CONFIG_FILE   = "zone_config.json"
+ENV_FILE           = ".env"
+OTODATA_API_URL    = "https://telematics.otodatanetwork.com:4432/v1.5/DataService.svc/GetAllDisplayPropaneDevices"
 
 st.set_page_config(page_title="Propane Dispatch Optimizer", layout="wide")
 
@@ -78,6 +82,69 @@ def save_zone_config(zones):
         return True
     except Exception:
         return False
+
+# ─── CREDENTIALS ─────────────────────────────────────────────────────────────
+
+def load_credentials():
+    """Load Nee-Vo credentials from .env file."""
+    creds = {"username": "", "password": ""}
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("NEEVO_USERNAME="):
+                    creds["username"] = line.split("=", 1)[1]
+                elif line.startswith("NEEVO_PASSWORD="):
+                    creds["password"] = line.split("=", 1)[1]
+    return creds
+
+def save_credentials(username, password):
+    """Save Nee-Vo credentials to .env file."""
+    lines = []
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE) as f:
+            lines = [l for l in f.readlines() if not l.startswith("NEEVO_")]
+    lines += [f"NEEVO_USERNAME={username}\n", f"NEEVO_PASSWORD={password}\n"]
+    with open(ENV_FILE, "w") as f:
+        f.writelines(lines)
+
+def fetch_otodata(username, password):
+    """
+    Pull all tank data from the Otodata API.
+    Returns a DataFrame normalized to match the expected column names,
+    or raises an exception on failure.
+    """
+    auth = base64.b64encode(f"{username}:{password}".encode()).decode()
+    headers = {"Authorization": f"Basic {auth}"}
+    resp = requests.get(OTODATA_API_URL, headers=headers, timeout=30, verify=False)
+    resp.raise_for_status()
+    data = resp.json()
+
+    rows = []
+    for tank in data:
+        # Compute ullage from level % and capacity
+        capacity_gal = tank.get("TankCapacity", 0) * 0.264172  # liters → gallons if needed
+        # TankCapacity from Otodata is already in gallons for US accounts
+        capacity_gal = tank.get("TankCapacity", 0)
+        level_pct = tank.get("Level", 0)
+        ullage = round(capacity_gal * (1 - level_pct / 100), 1)
+
+        rows.append({
+            "Customer Name": tank.get("CustomName") or tank.get("CompanyName", ""),
+            "City":          tank.get("City", ""),
+            "Address":       tank.get("Address", ""),
+            "Level (%)":     level_pct,
+            "Ullage":        ullage,
+            "Capacity":      capacity_gal,
+            "DTE":           tank.get("DTE", None),
+            "Account number":tank.get("SerialNumber", ""),
+            # lat/lon direct from API — skip geocoding for these
+            "lat":           tank.get("Latitude"),
+            "lon":           tank.get("Longitude"),
+            "S/N":           tank.get("SerialNumber", ""),
+        })
+
+    return pd.DataFrame(rows)
 
 # ─── GEOCODE CACHE ────────────────────────────────────────────────────────────
 
@@ -393,6 +460,20 @@ with st.sidebar:
     for t, c in TRUCKS_MASTER.items():
         st.caption(f"• {t}: {c:,}")
 
+    st.markdown("---")
+    st.subheader("🔑 Nee-Vo Credentials")
+    saved_creds = load_credentials()
+    neevo_user = st.text_input("Username / Email", value=saved_creds["username"])
+    neevo_pass = st.text_input("Password", value=saved_creds["password"], type="password")
+    if st.button("💾 Save Credentials", use_container_width=True):
+        save_credentials(neevo_user, neevo_pass)
+        st.success("Credentials saved!")
+    creds_ready = bool(neevo_user and neevo_pass)
+    if creds_ready:
+        st.caption("✅ Credentials loaded.")
+    else:
+        st.caption("⚠️ Enter credentials to enable live data fetch.")
+
 # ─── TITLE ───────────────────────────────────────────────────────────────────
 
 st.title("🚀 Propane Route Optimizer")
@@ -406,7 +487,30 @@ else:
 col_in, col_zn = st.columns(2)
 with col_in:
     st.subheader("1. Data Input")
-    telemetry_file = st.file_uploader("Upload Master Otodata CSV", type="csv")
+
+    live_df = None
+    fetch_error = None
+
+    if creds_ready:
+        if st.button("🔄 Fetch Live Data from Otodata", use_container_width=True):
+            with st.spinner("Connecting to Otodata API..."):
+                try:
+                    live_df = fetch_otodata(neevo_user, neevo_pass)
+                    st.session_state["live_df"] = live_df
+                    st.success(f"✅ Fetched {len(live_df)} tanks from Otodata.")
+                except Exception as e:
+                    fetch_error = str(e)
+                    st.error(f"❌ API fetch failed: {fetch_error}")
+    else:
+        st.info("Enter Nee-Vo credentials in the sidebar to enable live fetch.")
+
+    # Use cached live data if available from this session
+    if live_df is None and "live_df" in st.session_state:
+        live_df = st.session_state["live_df"]
+        st.caption("📡 Using data fetched this session.")
+
+    st.markdown("**— or —**")
+    telemetry_file = st.file_uploader("Upload Otodata CSV manually", type=["csv", "xlsx"])
     manual_file = st.file_uploader("Upload Manual Plan (Optional)", type="csv")
 
 with col_zn:
@@ -444,9 +548,20 @@ with col_zn:
 
 # ─── MAIN PROCESSING ─────────────────────────────────────────────────────────
 
-if telemetry_file:
+data_ready = live_df is not None or telemetry_file is not None
+
+if data_ready:
     try:
-        df = pd.read_csv(telemetry_file, encoding="latin1")
+        if live_df is not None:
+            df = live_df.copy()
+            # Live data already has lat/lon — skip geocoding for those rows
+            geo_prefilled = df["lat"].notna().any()
+        elif telemetry_file is not None:
+            if telemetry_file.name.endswith(".xlsx"):
+                df = pd.read_excel(telemetry_file)
+            else:
+                df = pd.read_csv(telemetry_file, encoding="latin1")
+            geo_prefilled = False
         detections = detect_columns(df)
 
         with st.expander("🔍 Column Detection Report", expanded=False):
@@ -542,8 +657,23 @@ if telemetry_file:
 
         # ── Geocoding → Clustering → Route Sort ──
         geo_available = False
-        if enable_geocoding and addr_col and city_col:
-            st.divider()
+        st.divider()
+
+        if geo_prefilled:
+            # Live API data already has lat/lon — only geocode rows missing coords
+            missing_geo = final_route_df["lat"].isna()
+            if missing_geo.any() and addr_col and city_col and enable_geocoding:
+                st.info(f"🛰️ {missing_geo.sum()} stops missing coordinates — geocoding those now...")
+                geocode_cache = load_geocode_cache()
+                partial = final_route_df[missing_geo].copy()
+                partial, geocode_cache = geocode_addresses(partial, addr_col, city_col, geocode_cache)
+                save_geocode_cache(geocode_cache)
+                final_route_df.loc[missing_geo, "lat"] = partial["lat"].values
+                final_route_df.loc[missing_geo, "lon"] = partial["lon"].values
+            else:
+                st.caption("📡 Using coordinates from Otodata API — no geocoding needed.")
+
+        elif enable_geocoding and addr_col and city_col:
             geocode_cache = load_geocode_cache()
             st.info("🛰️ Geocoding addresses — cached results load instantly.")
             final_route_df, geocode_cache = geocode_addresses(
@@ -551,21 +681,21 @@ if telemetry_file:
             )
             save_geocode_cache(geocode_cache)
 
-            no_geo = final_route_df["lat"].isna().sum()
-            if no_geo:
-                st.warning(f"⚠️ {no_geo} stop(s) could not be geocoded — appended at end of their route.")
+        no_geo = final_route_df["lat"].isna().sum() if "lat" in final_route_df.columns else len(final_route_df)
+        if no_geo:
+            st.warning(f"⚠️ {no_geo} stop(s) have no coordinates — appended at end of their route.")
 
-            routable_count = final_route_df["lat"].notna().sum()
-            if routable_count > 0:
-                geo_available = True
-                n_clusters = len(active_trucks)
-                final_route_df = cluster_stops(final_route_df, n_clusters)
-                map_df = final_route_df.dropna(subset=["lat", "lon"])
-                if not map_df.empty:
-                    st.map(map_df, latitude="lat", longitude="lon")
-                    st.caption(f"🗺️ {routable_count} stops mapped — {n_clusters} geographic cluster(s), one per truck.")
-            else:
-                st.warning("⚠️ No addresses geocoded. Falling back to capacity-only assignment.")
+        routable_count = final_route_df["lat"].notna().sum() if "lat" in final_route_df.columns else 0
+        if routable_count > 0:
+            geo_available = True
+            n_clusters = len(active_trucks)
+            final_route_df = cluster_stops(final_route_df, n_clusters)
+            map_df = final_route_df.dropna(subset=["lat", "lon"])
+            if not map_df.empty:
+                st.map(map_df, latitude="lat", longitude="lon")
+                st.caption(f"🗺️ {routable_count} stops mapped — {n_clusters} geographic cluster(s), one per truck.")
+        else:
+            st.warning("⚠️ No coordinates available. Falling back to capacity-only assignment.")
 
         # ── Assign + Route ──
         st.divider()
@@ -649,4 +779,4 @@ if telemetry_file:
         st.exception(e)
 
 else:
-    st.info("👋 Upload an Otodata CSV to begin.")
+    st.info("👋 Fetch live data from Otodata or upload a CSV to begin.")

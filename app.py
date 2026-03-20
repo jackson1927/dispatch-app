@@ -12,16 +12,72 @@ from sklearn.cluster import KMeans
 
 # --- CONFIGURATION ---
 TRUCKS_MASTER = {"Truck 225": 4160, "Truck 224": 2800, "Truck 108": 2240}
+
 DEFAULT_ZONES = {
-    "Monday": "ANNA MARIA, SARASOTA, ST PETE, HOLMES BEACH, BRADENTON BEACH, LONGBOAT KEY",
-    "Tuesday": "LAKELAND, HAINES CITY, POLK CITY, DAVENPORT, WINTER HAVEN, NEW PORT RICHEY, TAMPA, HUDSON, ALVA",
-    "Wednesday": "TAMPA, BRADENTON, SARASOTA, RUSKIN, PALMETTO, SUN CITY CENTER, PARRISH",
-    "Thursday": "TAMPA, BRANDON, PLANT CITY, VALRICO, RIVERVIEW, SEFFNER, DOVER",
-    "Friday": "ORLANDO, KISSIMMEE, LAKELAND, HAINES CITY, AUBURNDALE, CLERMONT"
+    "Monday":    "ANNA MARIA, HOLMES BEACH, BRADENTON BEACH, LONGBOAT KEY, SARASOTA, FORT MYERS",
+    "Tuesday":   "LAKELAND, HAINES CITY, PLANT CITY, POLK CITY, DAVENPORT, WINTER HAVEN, NEW PORT RICHEY, TAMPA",
+    "Wednesday": "TAMPA, RIVERVIEW, BRANDON, VALRICO, RUSKIN, SUN CITY CENTER",
+    "Thursday":  "TAMPA, RIVERVIEW, BRANDON, VALRICO, RUSKIN, SUN CITY CENTER",
+    "Friday":    "ORLANDO, KISSIMMEE, LAKELAND, HAINES CITY, AUBURNDALE, CLERMONT"
 }
+
+# Truck-to-zone slot mapping per day.
+# "Slot A" = primary truck (225), "Slot B" = secondary truck (224 or sub like 108).
+# Cities listed here are used to pre-assign stops to that truck's zone before spillover.
+# Days with no entry use pure geo-clustering with no lock.
+TRUCK_ZONE_SLOTS = {
+    "Monday": {
+        "Slot A": {
+            "cities": ["ANNA MARIA", "HOLMES BEACH", "BRADENTON BEACH", "LONGBOAT KEY", "SARASOTA", "FORT MYERS"],
+            "truck_preference": "Truck 225",
+        },
+        "Slot B": {
+            "cities": ["ST PETE", "ST. PETE", "SAINT PETE", "TAMPA", "KENNETH CITY", "PINELLAS PARK"],
+            "truck_preference": "Truck 224",
+        },
+    },
+    "Tuesday": {
+        "Slot A": {
+            "cities": ["LAKELAND", "HAINES CITY", "PLANT CITY", "POLK CITY", "DAVENPORT", "WINTER HAVEN", "AUBURNDALE"],
+            "truck_preference": "Truck 225",
+        },
+        "Slot B": {
+            "cities": ["NEW PORT RICHEY", "TAMPA", "HUDSON", "LAND O LAKES", "LUTZ", "ZEPHYRHILLS"],
+            "truck_preference": "Truck 224",
+        },
+    },
+}
+
+# Fallback truck for Slot B when preferred truck is unavailable (e.g. 224 is down)
+SLOT_B_FALLBACK = "Truck 108"
 GEOCODE_CACHE_FILE = "geocode_cache.json"
+ZONE_CONFIG_FILE   = "zone_config.json"
 
 st.set_page_config(page_title="Propane Dispatch Optimizer", layout="wide")
+
+# ─── ZONE CONFIG ─────────────────────────────────────────────────────────────
+
+def load_zone_config():
+    """Load saved zones from disk. Falls back to DEFAULT_ZONES if not found."""
+    if os.path.exists(ZONE_CONFIG_FILE):
+        try:
+            with open(ZONE_CONFIG_FILE, "r") as f:
+                saved = json.load(f)
+            for day, cities in DEFAULT_ZONES.items():
+                if day not in saved:
+                    saved[day] = cities
+            return saved
+        except Exception:
+            pass
+    return dict(DEFAULT_ZONES)
+
+def save_zone_config(zones):
+    try:
+        with open(ZONE_CONFIG_FILE, "w") as f:
+            json.dump(zones, f, indent=2)
+        return True
+    except Exception:
+        return False
 
 # ─── GEOCODE CACHE ────────────────────────────────────────────────────────────
 
@@ -206,26 +262,69 @@ def nearest_neighbor_sort(stops_df):
 
 # ─── TRUCK ASSIGNMENT ────────────────────────────────────────────────────────
 
-def assign_trucks_by_cluster(route_df, active_trucks, max_stops, name_col, use_geo):
+def resolve_slot_truck(slot_pref, active_trucks):
     """
-    If geo available: cluster-first assignment, then spill overflow to least-loaded truck.
-    If no geo: balanced greedy by DTE.
-    After assignment, each truck's stops are sorted by nearest-neighbor drive order.
+    Return the active truck for a slot. If the preferred truck isn't active,
+    fall back to SLOT_B_FALLBACK, then any available truck.
+    """
+    if slot_pref in active_trucks:
+        return slot_pref
+    if SLOT_B_FALLBACK in active_trucks:
+        return SLOT_B_FALLBACK
+    # Last resort: first available
+    return next(iter(active_trucks), None)
+
+def assign_trucks_by_cluster(route_df, active_trucks, max_stops, name_col, use_geo, route_day=""):
+    """
+    Assignment priority:
+      1. If the day has TRUCK_ZONE_SLOTS: match stops to slots by city, soft-lock to that truck.
+      2. Else if geo available: K-Means cluster → truck.
+      3. Else: balanced greedy by DTE.
+    After assignment each truck's stops are nearest-neighbor sorted.
+    Overflow always spills to the least-loaded truck with room.
     """
     truck_names = list(active_trucks.keys())
-    n_trucks = len(truck_names)
     trucks = {
         name: {"cap": cap, "load": 0, "stops": [], "count": 0}
         for name, cap in active_trucks.items()
     }
+    assigned_names = set()
+    sorted_df = route_df.sort_values("DTE_Num").reset_index(drop=True)
 
-    if use_geo and "cluster" in route_df.columns and (route_df["cluster"] >= 0).any():
-        cluster_to_truck = {i: truck_names[i % n_trucks] for i in range(int(route_df["cluster"].max()) + 1)}
-        sorted_df = route_df.sort_values(["cluster", "DTE_Num"]).reset_index(drop=True)
-        assigned_names = set()
+    day_slots = TRUCK_ZONE_SLOTS.get(route_day, {})
 
-        # Primary pass: home cluster
+    if day_slots:
+        # Build city → truck map from slots
+        city_to_truck = {}
+        for slot_info in day_slots.values():
+            t_name = resolve_slot_truck(slot_info["truck_preference"], active_trucks)
+            if t_name:
+                for city in slot_info["cities"]:
+                    city_to_truck[city.upper()] = t_name
+
+        # Primary pass: assign by city match
         for _, row in sorted_df.iterrows():
+            city_upper = str(row.get("City_Clean", "")).upper()
+            matched_truck = None
+            for city_key, t_name in city_to_truck.items():
+                if city_key in city_upper:
+                    matched_truck = t_name
+                    break
+            if matched_truck:
+                t_info = trucks[matched_truck]
+                if t_info["count"] < max_stops and t_info["load"] + row["Ullage_Num"] <= t_info["cap"]:
+                    r = row.copy()
+                    r["Assigned_Truck"] = matched_truck
+                    t_info["stops"].append(r)
+                    t_info["load"] += row["Ullage_Num"]
+                    t_info["count"] += 1
+                    assigned_names.add(row[name_col])
+
+    elif use_geo and "cluster" in route_df.columns and (route_df["cluster"] >= 0).any():
+        # Geo cluster → truck mapping
+        cluster_to_truck = {i: truck_names[i % len(truck_names)] for i in range(int(route_df["cluster"].max()) + 1)}
+        geo_sorted = route_df.sort_values(["cluster", "DTE_Num"]).reset_index(drop=True)
+        for _, row in geo_sorted.iterrows():
             cluster_id = int(row.get("cluster", -1))
             if cluster_id == -1:
                 continue
@@ -239,53 +338,29 @@ def assign_trucks_by_cluster(route_df, active_trucks, max_stops, name_col, use_g
                 t_info["count"] += 1
                 assigned_names.add(row[name_col])
 
-        # Spill pass: unassigned + unroutable (-1 cluster)
-        for _, row in sorted_df.iterrows():
-            if row[name_col] in assigned_names:
+    # Spill pass: anything unassigned (overflow, no city match, unroutable)
+    for _, row in sorted_df.iterrows():
+        if row[name_col] in assigned_names:
+            continue
+        ullage = row["Ullage_Num"]
+        best_truck, best_pct = None, 1.1
+        for t_name, t_info in trucks.items():
+            if t_info["count"] >= max_stops:
                 continue
-            ullage = row["Ullage_Num"]
-            best_truck, best_pct = None, 1.1
-            for t_name, t_info in trucks.items():
-                if t_info["count"] >= max_stops:
-                    continue
-                if ullage <= t_info["cap"] - t_info["load"]:
-                    pct = t_info["load"] / t_info["cap"]
-                    if pct < best_pct:
-                        best_pct = pct
-                        best_truck = t_name
-            if best_truck:
-                r = row.copy()
-                r["Assigned_Truck"] = best_truck
-                trucks[best_truck]["stops"].append(r)
-                trucks[best_truck]["load"] += ullage
-                trucks[best_truck]["count"] += 1
-                assigned_names.add(row[name_col])
+            if ullage <= t_info["cap"] - t_info["load"]:
+                pct = t_info["load"] / t_info["cap"]
+                if pct < best_pct:
+                    best_pct = pct
+                    best_truck = t_name
+        if best_truck:
+            r = row.copy()
+            r["Assigned_Truck"] = best_truck
+            trucks[best_truck]["stops"].append(r)
+            trucks[best_truck]["load"] += ullage
+            trucks[best_truck]["count"] += 1
+            assigned_names.add(row[name_col])
 
-        overflow_df = sorted_df[~sorted_df[name_col].isin(assigned_names)]
-
-    else:
-        # Fallback: balanced greedy
-        sorted_df = route_df.sort_values("DTE_Num").reset_index(drop=True)
-        assigned_names = set()
-        for _, row in sorted_df.iterrows():
-            ullage = row["Ullage_Num"]
-            best_truck, best_pct = None, 1.1
-            for t_name, t_info in trucks.items():
-                if t_info["count"] >= max_stops:
-                    continue
-                if ullage <= t_info["cap"] - t_info["load"]:
-                    pct = t_info["load"] / t_info["cap"]
-                    if pct < best_pct:
-                        best_pct = pct
-                        best_truck = t_name
-            if best_truck:
-                r = row.copy()
-                r["Assigned_Truck"] = best_truck
-                trucks[best_truck]["stops"].append(r)
-                trucks[best_truck]["load"] += ullage
-                trucks[best_truck]["count"] += 1
-                assigned_names.add(row[name_col])
-        overflow_df = sorted_df[~sorted_df[name_col].isin(assigned_names)]
+    overflow_df = sorted_df[~sorted_df[name_col].isin(assigned_names)]
 
     # Sort each truck's stops by nearest-neighbor drive order
     for t_info in trucks.values():
@@ -336,12 +411,36 @@ with col_in:
 
 with col_zn:
     st.subheader("2. Target Zones")
+    saved_zones = load_zone_config()
     route_day = st.selectbox("Select Day", list(DEFAULT_ZONES.keys()))
-    target_cities = [
-        c.strip().upper()
-        for c in st.text_area("Zone Cities", DEFAULT_ZONES[route_day]).split(",")
-        if c.strip()
-    ]
+
+    zone_text = st.text_area(
+        "Zone Cities (comma-separated)",
+        value=saved_zones.get(route_day, DEFAULT_ZONES[route_day]),
+        help="Edit cities for this day. Use 'Save as Default' to persist, or just run without saving for a one-off week."
+    )
+    target_cities = [c.strip().upper() for c in zone_text.split(",") if c.strip()]
+
+    z_col1, z_col2, z_col3 = st.columns(3)
+    with z_col1:
+        if st.button("💾 Save as Default", use_container_width=True, help="Saves this zone for every future run on this day"):
+            saved_zones[route_day] = zone_text
+            if save_zone_config(saved_zones):
+                st.success(f"Saved {route_day} zone!")
+            else:
+                st.error("Could not save zone config.")
+    with z_col2:
+        if st.button("↩️ Reset to Default", use_container_width=True, help="Revert to last saved default for this day"):
+            st.rerun()
+    with z_col3:
+        if st.button("🗑️ Clear All Zones", use_container_width=True, help="Reset ALL days back to factory defaults"):
+            if os.path.exists(ZONE_CONFIG_FILE):
+                os.remove(ZONE_CONFIG_FILE)
+            st.success("All zones reset.")
+            st.rerun()
+
+    if zone_text != saved_zones.get(route_day, DEFAULT_ZONES[route_day]):
+        st.caption("⚠️ Unsaved changes — running with this week's override only.")
 
 # ─── MAIN PROCESSING ─────────────────────────────────────────────────────────
 
@@ -473,7 +572,7 @@ if telemetry_file:
         st.subheader("3. Truck Assignments")
 
         trucks, overflow_df = assign_trucks_by_cluster(
-            final_route_df, active_trucks, max_stops, name_col, geo_available
+            final_route_df, active_trucks, max_stops, name_col, geo_available, route_day
         )
 
         if not overflow_df.empty:

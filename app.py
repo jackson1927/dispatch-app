@@ -70,6 +70,33 @@ def parse_numeric(series):
         series.astype(str).str.replace(r"[^\d.]", "", regex=True), errors="coerce"
     )
 
+import re as _re
+
+def parse_dte(series):
+    """
+    Parse DTE values from Otodata. Formats seen in real data:
+      - "30 hours" / "5 hours"   → convert to fractional days (min 1)
+      - "4 days" / "14 days"     → extract number as days
+      - "2 months" / "3 months"  → N * 30 days
+      - "> 3 months"             → treated same as N months
+      - None / unrecognized      → 99
+    """
+    def _parse(val):
+        if val is None:
+            return 99.0
+        s = str(val).strip().lower()
+        m = _re.search(r"(\d+)\s*month", s)
+        if m:
+            return int(m.group(1)) * 30
+        m = _re.search(r"(\d+\.?\d*)\s*hour", s)
+        if m:
+            return max(1.0, round(float(m.group(1)) / 24, 1))
+        m = _re.search(r"(\d+\.?\d*)", s)
+        if m:
+            return float(m.group(1))
+        return 99.0
+    return series.apply(_parse)
+
 # ─── GEOCODING ───────────────────────────────────────────────────────────────
 
 def geocode_addresses(df, addr_col, city_col, cache):
@@ -281,7 +308,9 @@ with st.sidebar:
     st.markdown("---")
     max_stops = st.slider("Max Stops per Truck", 10, 45, 22)
     dte_urgent = st.slider("🚨 Urgent DTE Threshold (days)", 1, 10, 2,
-                           help="Stops at or below this DTE are always included regardless of zone.")
+                           help="Stops at or below this DTE are flagged urgent.")
+    level_skip = st.slider("⛽ Skip if tank level above (%)", 10, 90, 60,
+                           help="If DTE is low but tank level is above this %, assume recently filled and skip.")
     enable_geocoding = st.toggle("🛰️ Enable Address Lookup + Route Optimization", value=True)
 
     st.markdown("---")
@@ -353,8 +382,9 @@ if telemetry_file:
         df["City_Clean"] = df[city_col].fillna("UNKNOWN").astype(str).str.upper()
         df["In_Zone"] = df["City_Clean"].apply(lambda x: any(t in x for t in target_cities))
         df["Ullage_Num"] = parse_numeric(df[ullage_col]).fillna(200) if ullage_col else pd.Series(200, index=df.index)
-        df["DTE_Num"] = parse_numeric(df[dte_col]).fillna(99) if dte_col else pd.Series(99, index=df.index)
+        df["DTE_Num"] = parse_dte(df[dte_col]) if dte_col else pd.Series(99, index=df.index)
         df["Level_Disp"] = df[level_col].fillna("N/A") if level_col else "N/A"
+        df["Level_Num"] = parse_numeric(df[level_col]).fillna(0) if level_col else pd.Series(0, index=df.index)
 
         # ── Manual Overrides ──
         final_route_df = pd.DataFrame()
@@ -379,8 +409,10 @@ if telemetry_file:
         total_cap = sum(active_trucks.values())
         current_load = final_route_df["Ullage_Num"].sum() if not final_route_df.empty else 0
         manual_ids = final_route_df[name_col].tolist() if not final_route_df.empty else []
+        # A stop is "truly urgent" if DTE is low AND level is also low (not recently filled)
         pool = df[~df[name_col].isin(manual_ids)].copy()
-        pool = pool[pool["In_Zone"] | (pool["DTE_Num"] <= dte_urgent)].sort_values("DTE_Num")
+        pool["Truly_Urgent"] = (pool["DTE_Num"] <= dte_urgent) & (pool["Level_Num"] < level_skip)
+        pool = pool[pool["In_Zone"] | pool["Truly_Urgent"]].sort_values("DTE_Num")
 
         added = []
         for _, row in pool.iterrows():

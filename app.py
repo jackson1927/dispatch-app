@@ -55,7 +55,7 @@ SLOT_B_FALLBACK = "Truck 108"
 GEOCODE_CACHE_FILE = "geocode_cache.json"
 ZONE_CONFIG_FILE   = "zone_config.json"
 ENV_FILE           = ".env"
-OTODATA_API_URL    = "https://telematics.otodatanetwork.com:4432/v1.5/DataService.svc/GetAllDisplayPropaneDevices"
+
 
 st.set_page_config(page_title="Propane Dispatch Optimizer", layout="wide")
 
@@ -108,41 +108,98 @@ def save_credentials(username, password):
     with open(ENV_FILE, "w") as f:
         f.writelines(lines)
 
+OTODATA_LOGIN_URL  = "https://neevo.otodata.ca/Account/Login"
+OTODATA_DATA_URL   = (
+    "https://neevo.otodata.ca/odata/TankOData?"
+    "$select=SerialNumber,LastLevel,Ullage,Capacity,HoursToLimit,"
+    "CustomerName,Address,City,SensorTroubleStatus,LastProductTransfer,"
+    "Id,DeviceId,TankId,TankName,DispatchBy,DispatchDate,Status,"
+    "StatusKey,StatusPriority,ProductName,RouteName,IsAddressNullOrEmpty,"
+    "IsCityNullOrEmpty,IsCustomerNameNullOrEmpty,IsAccountNumberNullOrEmpty"
+)
+
 def fetch_otodata(username, password):
     """
-    Pull all tank data from the Otodata API.
-    Returns a DataFrame normalized to match the expected column names,
-    or raises an exception on failure.
+    Log in to neevo.otodata.ca using ASP.NET form auth, then pull tank data.
+    Uses a requests.Session to carry the auth cookie automatically.
+    Returns a normalized DataFrame.
     """
-    auth = base64.b64encode(f"{username}:{password}".encode()).decode()
-    headers = {"Authorization": f"Basic {auth}"}
-    resp = requests.get(OTODATA_API_URL, headers=headers, timeout=30, verify=False)
-    resp.raise_for_status()
-    data = resp.json()
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+
+    # Step 1: GET login page to grab the anti-forgery token
+    login_page = session.get(OTODATA_LOGIN_URL, timeout=15, verify=True)
+    login_page.raise_for_status()
+
+    # Parse __RequestVerificationToken from the form
+    import re as _re2
+    token_match = _re2.search(
+        r'<input[^>]+name="__RequestVerificationToken"[^>]+value="([^"]+)"',
+        login_page.text
+    )
+    token = token_match.group(1) if token_match else ""
+
+    # Step 2: POST credentials
+    payload = {
+        "UserName": username,
+        "Password": password,
+        "__RequestVerificationToken": token,
+    }
+    login_resp = session.post(
+        OTODATA_LOGIN_URL,
+        data=payload,
+        timeout=15,
+        verify=True,
+        allow_redirects=True,
+    )
+
+    # Check we actually got in — failed logins usually redirect back to /Account/Login
+    if "Account/Login" in login_resp.url or login_resp.status_code == 401:
+        raise Exception("Login failed — check your Nee-Vo username and password.")
+
+    # Step 3: Fetch tank data with the active session cookie
+    data_resp = session.get(
+        OTODATA_DATA_URL,
+        headers={"Accept": "application/json;odata=verbose,text/plain, */*; q=0.01",
+                 "X-Requested-With": "XMLHttpRequest"},
+        timeout=30,
+        verify=True,
+    )
+    data_resp.raise_for_status()
+    payload_json = data_resp.json()
+
+    # OData wraps results in {"value": [...]}
+    tanks = payload_json.get("value", payload_json) if isinstance(payload_json, dict) else payload_json
 
     rows = []
-    for tank in data:
-        # Compute ullage from level % and capacity
-        capacity_gal = tank.get("TankCapacity", 0) * 0.264172  # liters → gallons if needed
-        # TankCapacity from Otodata is already in gallons for US accounts
-        capacity_gal = tank.get("TankCapacity", 0)
-        level_pct = tank.get("Level", 0)
-        ullage = round(capacity_gal * (1 - level_pct / 100), 1)
+    for tank in tanks:
+        level_pct  = tank.get("LastLevel") or 0
+        capacity   = tank.get("Capacity") or 0
+        ullage_raw = tank.get("Ullage")
+        ullage     = ullage_raw if ullage_raw is not None else round(capacity * (1 - level_pct / 100), 1)
 
         rows.append({
-            "Customer Name": tank.get("CustomName") or tank.get("CompanyName", ""),
-            "City":          tank.get("City", ""),
-            "Address":       tank.get("Address", ""),
-            "Level (%)":     level_pct,
-            "Ullage":        ullage,
-            "Capacity":      capacity_gal,
-            "DTE":           tank.get("DTE", None),
-            "Account number":tank.get("SerialNumber", ""),
-            # lat/lon direct from API — skip geocoding for these
-            "lat":           tank.get("Latitude"),
-            "lon":           tank.get("Longitude"),
-            "S/N":           tank.get("SerialNumber", ""),
+            "Customer Name":  tank.get("CustomerName", ""),
+            "City":           tank.get("City", ""),
+            "Address":        tank.get("Address", ""),
+            "Level (%)":      level_pct,
+            "Ullage":         ullage,
+            "Capacity":       capacity,
+            "DTE":            tank.get("HoursToLimit"),
+            "Account number": tank.get("SerialNumber", ""),
+            "lat":            None,   # neevo.otodata.ca OData doesn't return coords
+            "lon":            None,
+            "S/N":            tank.get("SerialNumber", ""),
+            "Last Fill":      tank.get("LastProductTransfer"),
+            "Status":         tank.get("Status", ""),
+            "Tank Name":      tank.get("TankName", ""),
         })
+
+    if not rows:
+        raise Exception("API returned 0 tanks. Check that your account has active monitors.")
 
     return pd.DataFrame(rows)
 
@@ -596,7 +653,15 @@ if data_ready:
         df["City_Clean"] = df[city_col].fillna("UNKNOWN").astype(str).str.upper()
         df["In_Zone"] = df["City_Clean"].apply(lambda x: any(t in x for t in target_cities))
         df["Ullage_Num"] = parse_numeric(df[ullage_col]).fillna(200) if ullage_col else pd.Series(200, index=df.index)
-        df["DTE_Num"] = parse_dte(df[dte_col]) if dte_col else pd.Series(99, index=df.index)
+        if dte_col:
+            if geo_prefilled:
+                # Live API: HoursToLimit is numeric hours — convert directly to days
+                df["DTE_Num"] = pd.to_numeric(df[dte_col], errors="coerce").fillna(99 * 24) / 24
+            else:
+                # CSV export: text strings like "5 days", "> 3 months"
+                df["DTE_Num"] = parse_dte(df[dte_col])
+        else:
+            df["DTE_Num"] = pd.Series(99, index=df.index)
         df["Level_Disp"] = df[level_col].fillna("N/A") if level_col else "N/A"
         df["Level_Num"] = parse_numeric(df[level_col]).fillna(0) if level_col else pd.Series(0, index=df.index)
 

@@ -85,31 +85,59 @@ def save_zone_config(zones):
 
 # ─── CREDENTIALS ─────────────────────────────────────────────────────────────
 
-def load_credentials():
-    """Load Nee-Vo credentials from .env file."""
-    creds = {"username": "", "password": ""}
-    if os.path.exists(ENV_FILE):
-        with open(ENV_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("NEEVO_USERNAME="):
-                    creds["username"] = line.split("=", 1)[1]
-                elif line.startswith("NEEVO_PASSWORD="):
-                    creds["password"] = line.split("=", 1)[1]
-    return creds
+TOKEN_FILE = "neevo_token.json"
 
-def save_credentials(username, password):
-    """Save Nee-Vo credentials to .env file."""
-    lines = []
-    if os.path.exists(ENV_FILE):
-        with open(ENV_FILE) as f:
-            lines = [l for l in f.readlines() if not l.startswith("NEEVO_")]
-    lines += [f"NEEVO_USERNAME={username}\n", f"NEEVO_PASSWORD={password}\n"]
-    with open(ENV_FILE, "w") as f:
-        f.writelines(lines)
+def load_tokens():
+    """Load saved access/refresh tokens from disk."""
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"access_token": "", "refresh_token": "", "expires": ""}
 
-OTODATA_LOGIN_URL  = "https://neevo.otodata.ca/Account/Login"
-OTODATA_DATA_URL   = (
+def save_tokens(access_token, refresh_token, expires):
+    """Persist tokens to disk."""
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            json.dump({"access_token": access_token,
+                       "refresh_token": refresh_token,
+                       "expires": expires}, f)
+    except Exception:
+        pass
+
+def refresh_access_token(refresh_token):
+    """
+    Use the refresh_token to get a new access_token silently.
+    Returns (new_access_token, new_refresh_token, new_expires) or raises on failure.
+    """
+    resp = requests.post(
+        "https://neevo.otodata.ca/token",
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Accept": "application/json, text/plain, */*"},
+        timeout=15,
+        verify=True,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["access_token"], data.get("refresh_token", refresh_token), data.get(".expires", "")
+
+def token_is_expired(expires_str):
+    """Return True if the token expiry time is within 10 minutes."""
+    if not expires_str:
+        return True
+    try:
+        # Format: "Fri, 20 Mar 2026 22:40:07 GMT"
+        from email.utils import parsedate_to_datetime
+        exp = parsedate_to_datetime(expires_str)
+        exp = exp.replace(tzinfo=None)  # strip tz for naive comparison
+        return datetime.datetime.utcnow() >= exp - datetime.timedelta(minutes=10)
+    except Exception:
+        return True
+
+OTODATA_DATA_URL = (
     "https://neevo.otodata.ca/odata/TankOData?"
     "$select=SerialNumber,LastLevel,Ullage,Capacity,HoursToLimit,"
     "CustomerName,Address,City,SensorTroubleStatus,LastProductTransfer,"
@@ -118,60 +146,20 @@ OTODATA_DATA_URL   = (
     "IsCityNullOrEmpty,IsCustomerNameNullOrEmpty,IsAccountNumberNullOrEmpty"
 )
 
-def fetch_otodata(username, password):
+def fetch_otodata(access_token):
     """
-    Log in to neevo.otodata.ca using ASP.NET form auth, then pull tank data.
-    Uses a requests.Session to carry the auth cookie automatically.
+    Pull all tank data using a Bearer access token.
     Returns a normalized DataFrame.
     """
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
-
-    # Step 1: GET login page to grab the anti-forgery token
-    login_page = session.get(OTODATA_LOGIN_URL, timeout=15, verify=True)
-    login_page.raise_for_status()
-
-    # Parse __RequestVerificationToken from the form
-    import re as _re2
-    token_match = _re2.search(
-        r'<input[^>]+name="__RequestVerificationToken"[^>]+value="([^"]+)"',
-        login_page.text
-    )
-    token = token_match.group(1) if token_match else ""
-
-    # Step 2: POST credentials
-    payload = {
-        "UserName": username,
-        "Password": password,
-        "__RequestVerificationToken": token,
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
     }
-    login_resp = session.post(
-        OTODATA_LOGIN_URL,
-        data=payload,
-        timeout=15,
-        verify=True,
-        allow_redirects=True,
-    )
+    resp = requests.get(OTODATA_DATA_URL, headers=headers, timeout=30, verify=True)
+    resp.raise_for_status()
+    payload_json = resp.json()
 
-    # Check we actually got in — failed logins usually redirect back to /Account/Login
-    if "Account/Login" in login_resp.url or login_resp.status_code == 401:
-        raise Exception("Login failed — check your Nee-Vo username and password.")
-
-    # Step 3: Fetch tank data with the active session cookie
-    data_resp = session.get(
-        OTODATA_DATA_URL,
-        headers={"Accept": "application/json;odata=verbose,text/plain, */*; q=0.01",
-                 "X-Requested-With": "XMLHttpRequest"},
-        timeout=30,
-        verify=True,
-    )
-    data_resp.raise_for_status()
-    payload_json = data_resp.json()
-
-    # OData wraps results in {"value": [...]}
     tanks = payload_json.get("value", payload_json) if isinstance(payload_json, dict) else payload_json
 
     rows = []
@@ -180,7 +168,6 @@ def fetch_otodata(username, password):
         capacity   = tank.get("Capacity") or 0
         ullage_raw = tank.get("Ullage")
         ullage     = ullage_raw if ullage_raw is not None else round(capacity * (1 - level_pct / 100), 1)
-
         rows.append({
             "Customer Name":  tank.get("CustomerName", ""),
             "City":           tank.get("City", ""),
@@ -190,7 +177,7 @@ def fetch_otodata(username, password):
             "Capacity":       capacity,
             "DTE":            tank.get("HoursToLimit"),
             "Account number": tank.get("SerialNumber", ""),
-            "lat":            None,   # neevo.otodata.ca OData doesn't return coords
+            "lat":            None,
             "lon":            None,
             "S/N":            tank.get("SerialNumber", ""),
             "Last Fill":      tank.get("LastProductTransfer"),
@@ -518,18 +505,48 @@ with st.sidebar:
         st.caption(f"• {t}: {c:,}")
 
     st.markdown("---")
-    st.subheader("🔑 Nee-Vo Credentials")
-    saved_creds = load_credentials()
-    neevo_user = st.text_input("Username / Email", value=saved_creds["username"])
-    neevo_pass = st.text_input("Password", value=saved_creds["password"], type="password")
-    if st.button("💾 Save Credentials", use_container_width=True):
-        save_credentials(neevo_user, neevo_pass)
-        st.success("Credentials saved!")
-    creds_ready = bool(neevo_user and neevo_pass)
+    st.subheader("🔑 Nee-Vo Token")
+    saved_tokens = load_tokens()
+
+    # Auto-refresh if we have a refresh token and access token is expiring
+    if saved_tokens["refresh_token"] and token_is_expired(saved_tokens["expires"]):
+        try:
+            new_access, new_refresh, new_expires = refresh_access_token(saved_tokens["refresh_token"])
+            save_tokens(new_access, new_refresh, new_expires)
+            saved_tokens = {"access_token": new_access, "refresh_token": new_refresh, "expires": new_expires}
+            st.caption("🔄 Token auto-refreshed.")
+        except Exception:
+            pass  # Will fall through to manual entry
+
+    access_token_input = st.text_area(
+        "Paste Access Token",
+        value=saved_tokens.get("access_token", ""),
+        height=80,
+        help="From browser dev tools → Network → token → Response → access_token"
+    )
+    refresh_token_input = st.text_input(
+        "Paste Refresh Token",
+        value=saved_tokens.get("refresh_token", ""),
+        type="password",
+        help="From same response — refresh_token field"
+    )
+    expires_input = st.text_input(
+        "Token Expiry (.expires)",
+        value=saved_tokens.get("expires", ""),
+        help="The .expires value from the token response"
+    )
+    if st.button("💾 Save Token", use_container_width=True):
+        save_tokens(access_token_input, refresh_token_input, expires_input)
+        st.success("Token saved!")
+
+    creds_ready = bool(access_token_input)
     if creds_ready:
-        st.caption("✅ Credentials loaded.")
+        if token_is_expired(expires_input):
+            st.caption("⚠️ Token may be expired — will try to auto-refresh.")
+        else:
+            st.caption(f"✅ Token loaded. Expires: {expires_input}")
     else:
-        st.caption("⚠️ Enter credentials to enable live data fetch.")
+        st.caption("⚠️ Paste your access token to enable live fetch.")
 
 # ─── TITLE ───────────────────────────────────────────────────────────────────
 
@@ -552,14 +569,25 @@ with col_in:
         if st.button("🔄 Fetch Live Data from Otodata", use_container_width=True):
             with st.spinner("Connecting to Otodata API..."):
                 try:
-                    live_df = fetch_otodata(neevo_user, neevo_pass)
+                    # Auto-refresh token if needed before fetching
+                    current_tokens = load_tokens()
+                    active_token = access_token_input
+                    if token_is_expired(current_tokens.get("expires", "")) and current_tokens.get("refresh_token"):
+                        try:
+                            new_access, new_refresh, new_expires = refresh_access_token(current_tokens["refresh_token"])
+                            save_tokens(new_access, new_refresh, new_expires)
+                            active_token = new_access
+                            st.caption("🔄 Token refreshed automatically.")
+                        except Exception:
+                            pass  # Try with existing token anyway
+                    live_df = fetch_otodata(active_token)
                     st.session_state["live_df"] = live_df
                     st.success(f"✅ Fetched {len(live_df)} tanks from Otodata.")
                 except Exception as e:
                     fetch_error = str(e)
                     st.error(f"❌ API fetch failed: {fetch_error}")
     else:
-        st.info("Enter Nee-Vo credentials in the sidebar to enable live fetch.")
+        st.info("Paste your Nee-Vo access token in the sidebar to enable live fetch.")
 
     # Use cached live data if available from this session
     if live_df is None and "live_df" in st.session_state:

@@ -6,8 +6,6 @@ import hashlib
 import json
 import numpy as np
 
-import requests
-import base64
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 from sklearn.cluster import KMeans
@@ -54,7 +52,6 @@ TRUCK_ZONE_SLOTS = {
 SLOT_B_FALLBACK = "Truck 108"
 GEOCODE_CACHE_FILE = "geocode_cache.json"
 ZONE_CONFIG_FILE   = "zone_config.json"
-ENV_FILE           = ".env"
 
 
 st.set_page_config(page_title="Propane Dispatch Optimizer", layout="wide")
@@ -85,115 +82,9 @@ def save_zone_config(zones):
 
 # ─── CREDENTIALS ─────────────────────────────────────────────────────────────
 
-TOKEN_FILE = "neevo_token.json"
 
-def load_tokens():
-    """Load saved access/refresh tokens from disk."""
-    if os.path.exists(TOKEN_FILE):
-        try:
-            with open(TOKEN_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"access_token": "", "refresh_token": "", "expires": ""}
 
-def save_tokens(session_cookie, refresh_token="", expires=""):
-    """Persist session cookie to disk."""
-    try:
-        with open(TOKEN_FILE, "w") as f:
-            json.dump({"session_cookie": session_cookie,
-                       "refresh_token": refresh_token,
-                       "expires": expires}, f)
-    except Exception:
-        pass
 
-def refresh_access_token(refresh_token):
-    """
-    Use the refresh_token to get a new access_token silently.
-    Returns (new_access_token, new_refresh_token, new_expires) or raises on failure.
-    """
-    resp = requests.post(
-        "https://neevo.otodata.ca/token",
-        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
-        headers={"Content-Type": "application/x-www-form-urlencoded",
-                 "Accept": "application/json, text/plain, */*"},
-        timeout=15,
-        verify=True,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data["access_token"], data.get("refresh_token", refresh_token), data.get(".expires", "")
-
-def token_is_expired(expires_str):
-    """Return True if the token expiry time is within 10 minutes."""
-    if not expires_str:
-        return True
-    try:
-        # Format: "Fri, 20 Mar 2026 22:40:07 GMT"
-        from email.utils import parsedate_to_datetime
-        exp = parsedate_to_datetime(expires_str)
-        exp = exp.replace(tzinfo=None)  # strip tz for naive comparison
-        return datetime.datetime.utcnow() >= exp - datetime.timedelta(minutes=10)
-    except Exception:
-        return True
-
-OTODATA_DATA_URL = (
-    "https://neevo.otodata.ca/odata/TankOData?"
-    "$select=SerialNumber,LastLevel,Ullage,Capacity,HoursToLimit,"
-    "CustomerName,Address,City,SensorTroubleStatus,LastProductTransfer,"
-    "Id,DeviceId,TankId,TankName,DispatchBy,DispatchDate,Status,"
-    "StatusKey,StatusPriority,ProductName,RouteName,IsAddressNullOrEmpty,"
-    "IsCityNullOrEmpty,IsCustomerNameNullOrEmpty,IsAccountNumberNullOrEmpty"
-)
-
-def fetch_otodata(session_cookie):
-    """
-    Pull all tank data using the AspNet.Cookies session cookie.
-    Returns a normalized DataFrame.
-    """
-    resp = requests.get(
-        OTODATA_DATA_URL,
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": "https://neevo.otodata.ca/",
-        },
-        cookies={"AspNet.Cookies": session_cookie},
-        timeout=30,
-        verify=True,
-    )
-    resp.raise_for_status()
-    payload_json = resp.json()
-
-    tanks = payload_json.get("value", payload_json) if isinstance(payload_json, dict) else payload_json
-
-    rows = []
-    for tank in tanks:
-        level_pct  = tank.get("LastLevel") or 0
-        capacity   = tank.get("Capacity") or 0
-        ullage_raw = tank.get("Ullage")
-        ullage     = ullage_raw if ullage_raw is not None else round(capacity * (1 - level_pct / 100), 1)
-        rows.append({
-            "Customer Name":  tank.get("CustomerName", ""),
-            "City":           tank.get("City", ""),
-            "Address":        tank.get("Address", ""),
-            "Level (%)":      level_pct,
-            "Ullage":         ullage,
-            "Capacity":       capacity,
-            "DTE":            tank.get("HoursToLimit"),
-            "Account number": tank.get("SerialNumber", ""),
-            "lat":            None,
-            "lon":            None,
-            "S/N":            tank.get("SerialNumber", ""),
-            "Last Fill":      tank.get("LastProductTransfer"),
-            "Status":         tank.get("Status", ""),
-            "Tank Name":      tank.get("TankName", ""),
-        })
-
-    if not rows:
-        raise Exception("API returned 0 tanks. Check that your account has active monitors.")
-
-    return pd.DataFrame(rows)
 
 # ─── GEOCODE CACHE ────────────────────────────────────────────────────────────
 
@@ -578,25 +469,7 @@ with st.sidebar:
     for t, c in TRUCKS_MASTER.items():
         st.caption(f"• {t}: {c:,}")
 
-    st.markdown("---")
-    st.subheader("🔑 Nee-Vo Session")
-    saved_tokens = load_tokens()
 
-    session_cookie_input = st.text_area(
-        "Paste AspNet.Cookies value",
-        value=saved_tokens.get("session_cookie", ""),
-        height=80,
-        help="From browser dev tools → Network → TankOData → Cookies tab → AspNet.Cookies value"
-    )
-    if st.button("💾 Save Session Cookie", use_container_width=True):
-        save_tokens(session_cookie_input, "", "")
-        st.success("Session cookie saved!")
-
-    creds_ready = bool(session_cookie_input.strip())
-    if creds_ready:
-        st.caption("✅ Session cookie loaded.")
-    else:
-        st.caption("⚠️ Paste your session cookie to enable live fetch.")
 
 # ─── TITLE ───────────────────────────────────────────────────────────────────
 
@@ -612,29 +485,7 @@ col_in, col_zn = st.columns(2)
 with col_in:
     st.subheader("1. Data Input")
 
-    live_df = None
-    fetch_error = None
-
-    if creds_ready:
-        if st.button("🔄 Fetch Live Data from Otodata", use_container_width=True):
-            with st.spinner("Connecting to Otodata API..."):
-                try:
-                    live_df = fetch_otodata(session_cookie_input.strip())
-                    st.session_state["live_df"] = live_df
-                    st.success(f"✅ Fetched {len(live_df)} tanks from Otodata.")
-                except Exception as e:
-                    fetch_error = str(e)
-                    st.error(f"❌ API fetch failed: {fetch_error}")
-    else:
-        st.info("Paste your Nee-Vo access token in the sidebar to enable live fetch.")
-
-    # Use cached live data if available from this session
-    if live_df is None and "live_df" in st.session_state:
-        live_df = st.session_state["live_df"]
-        st.caption("📡 Using data fetched this session.")
-
-    st.markdown("**— or —**")
-    telemetry_file = st.file_uploader("Upload Otodata CSV manually", type=["csv", "xlsx"])
+    telemetry_file = st.file_uploader("Upload Otodata CSV", type=["csv", "xlsx"])
     manual_file = st.file_uploader("Upload Manual Plan (Optional)", type="csv")
     delivery_file = st.file_uploader("📦 Upload Delivery History (Route Manager)", type="csv",
                                      help="Last 30 days export from Route Manager — used to validate monitor DTE")
@@ -674,20 +525,15 @@ with col_zn:
 
 # ─── MAIN PROCESSING ─────────────────────────────────────────────────────────
 
-data_ready = live_df is not None or telemetry_file is not None
+data_ready = telemetry_file is not None
 
 if data_ready:
     try:
-        if live_df is not None:
-            df = live_df.copy()
-            # Live data already has lat/lon — skip geocoding for those rows
-            geo_prefilled = df["lat"].notna().any()
-        elif telemetry_file is not None:
-            if telemetry_file.name.endswith(".xlsx"):
-                df = pd.read_excel(telemetry_file)
-            else:
-                df = pd.read_csv(telemetry_file, encoding="latin1")
-            geo_prefilled = False
+        if telemetry_file.name.endswith(".xlsx"):
+            df = pd.read_excel(telemetry_file)
+        else:
+            df = pd.read_csv(telemetry_file, encoding="latin1")
+        geo_prefilled = False
         detections = detect_columns(df)
 
         with st.expander("🔍 Column Detection Report", expanded=False):
@@ -940,4 +786,4 @@ if data_ready:
         st.exception(e)
 
 else:
-    st.info("👋 Fetch live data from Otodata or upload a CSV to begin.")
+    st.info("👋 Upload your Otodata CSV to begin.")

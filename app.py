@@ -97,11 +97,11 @@ def load_tokens():
             pass
     return {"access_token": "", "refresh_token": "", "expires": ""}
 
-def save_tokens(access_token, refresh_token, expires):
-    """Persist tokens to disk."""
+def save_tokens(session_cookie, refresh_token="", expires=""):
+    """Persist session cookie to disk."""
     try:
         with open(TOKEN_FILE, "w") as f:
-            json.dump({"access_token": access_token,
+            json.dump({"session_cookie": session_cookie,
                        "refresh_token": refresh_token,
                        "expires": expires}, f)
     except Exception:
@@ -146,17 +146,22 @@ OTODATA_DATA_URL = (
     "IsCityNullOrEmpty,IsCustomerNameNullOrEmpty,IsAccountNumberNullOrEmpty"
 )
 
-def fetch_otodata(access_token):
+def fetch_otodata(session_cookie):
     """
-    Pull all tank data using a Bearer access token.
+    Pull all tank data using the AspNet.Cookies session cookie.
     Returns a normalized DataFrame.
     """
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json, text/plain, */*",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    resp = requests.get(OTODATA_DATA_URL, headers=headers, timeout=30, verify=True)
+    resp = requests.get(
+        OTODATA_DATA_URL,
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://neevo.otodata.ca/",
+        },
+        cookies={"AspNet.Cookies": session_cookie},
+        timeout=30,
+        verify=True,
+    )
     resp.raise_for_status()
     payload_json = resp.json()
 
@@ -482,6 +487,75 @@ def assign_trucks_by_cluster(route_df, active_trucks, max_stops, name_col, use_g
 
     return trucks, overflow_df
 
+# ─── DELIVERY HISTORY ────────────────────────────────────────────────────────
+
+def parse_delivery_history(del_df):
+    """
+    Parse Route Manager last-delivery export into a per-customer consumption dict.
+    Returns: { normalized_name: { "gpd": float, "last_fill_date": date, "last_fill_qty": int } }
+    """
+    result = {}
+    for _, row in del_df.iterrows():
+        dates, qtys = [], []
+        for i in range(1, 6):
+            d = row.get(f"del_date{i}")
+            q = row.get(f"qty{i}", 0)
+            try:
+                d_parsed = pd.to_datetime(d, errors="coerce")
+                if pd.notna(d_parsed) and float(q) > 0:
+                    dates.append(d_parsed)
+                    qtys.append(float(q))
+            except Exception:
+                pass
+
+        if not dates:
+            continue
+
+        gpd = 0.0
+        if len(dates) >= 2:
+            span = (dates[0] - dates[-1]).days
+            if span > 0:
+                gpd = round(sum(qtys) / span, 2)
+
+        # Normalize name for fuzzy matching
+        name_raw = str(row.get("cust_name", "") or row.get("rou_cname", "")).strip().upper()
+        result[name_raw] = {
+            "gpd":            gpd,
+            "last_fill_date": dates[0].date() if dates else None,
+            "last_fill_qty":  int(qtys[0]) if qtys else 0,
+            "city":           str(row.get("rou_city", "")).strip().upper(),
+            "address":        str(row.get("rou_add1", "")).strip().upper(),
+        }
+    return result
+
+def validate_dte_with_history(row, delivery_lookup, level_col_name="Level_Num", dte_col_name="DTE_Num"):
+    """
+    Cross-check monitor DTE against delivery history GPD.
+    Flags a stop as SUSPECT if:
+      - Monitor DTE is low (urgent) BUT calculated days-of-supply from history >> monitor DTE
+      - Threshold: history says 3x more days remaining than monitor
+    Returns a flag string: "" | "⚠️ Sensor suspect" | "📋 History only"
+    """
+    name = str(row.get("Customer Name", "")).strip().upper()
+    hist = delivery_lookup.get(name)
+
+    if not hist or hist["gpd"] <= 0:
+        return ""
+
+    level = row.get(level_col_name, 0) or 0
+    capacity = row.get("Capacity", 0) or 0
+    monitor_dte = row.get(dte_col_name, 99) or 99
+
+    if capacity > 0 and level > 0:
+        gal_remaining = capacity * (level / 100)
+        history_dte = round(gal_remaining / hist["gpd"], 1)
+
+        # Flag if history says significantly more days than monitor
+        if monitor_dte <= 7 and history_dte > monitor_dte * 3:
+            return f"⚠️ Sensor suspect (history≈{history_dte:.0f}d)"
+
+    return ""
+
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
 
 with st.sidebar:
@@ -505,48 +579,24 @@ with st.sidebar:
         st.caption(f"• {t}: {c:,}")
 
     st.markdown("---")
-    st.subheader("🔑 Nee-Vo Token")
+    st.subheader("🔑 Nee-Vo Session")
     saved_tokens = load_tokens()
 
-    # Auto-refresh if we have a refresh token and access token is expiring
-    if saved_tokens["refresh_token"] and token_is_expired(saved_tokens["expires"]):
-        try:
-            new_access, new_refresh, new_expires = refresh_access_token(saved_tokens["refresh_token"])
-            save_tokens(new_access, new_refresh, new_expires)
-            saved_tokens = {"access_token": new_access, "refresh_token": new_refresh, "expires": new_expires}
-            st.caption("🔄 Token auto-refreshed.")
-        except Exception:
-            pass  # Will fall through to manual entry
-
-    access_token_input = st.text_area(
-        "Paste Access Token",
-        value=saved_tokens.get("access_token", ""),
+    session_cookie_input = st.text_area(
+        "Paste AspNet.Cookies value",
+        value=saved_tokens.get("session_cookie", ""),
         height=80,
-        help="From browser dev tools → Network → token → Response → access_token"
+        help="From browser dev tools → Network → TankOData → Cookies tab → AspNet.Cookies value"
     )
-    refresh_token_input = st.text_input(
-        "Paste Refresh Token",
-        value=saved_tokens.get("refresh_token", ""),
-        type="password",
-        help="From same response — refresh_token field"
-    )
-    expires_input = st.text_input(
-        "Token Expiry (.expires)",
-        value=saved_tokens.get("expires", ""),
-        help="The .expires value from the token response"
-    )
-    if st.button("💾 Save Token", use_container_width=True):
-        save_tokens(access_token_input, refresh_token_input, expires_input)
-        st.success("Token saved!")
+    if st.button("💾 Save Session Cookie", use_container_width=True):
+        save_tokens(session_cookie_input, "", "")
+        st.success("Session cookie saved!")
 
-    creds_ready = bool(access_token_input)
+    creds_ready = bool(session_cookie_input.strip())
     if creds_ready:
-        if token_is_expired(expires_input):
-            st.caption("⚠️ Token may be expired — will try to auto-refresh.")
-        else:
-            st.caption(f"✅ Token loaded. Expires: {expires_input}")
+        st.caption("✅ Session cookie loaded.")
     else:
-        st.caption("⚠️ Paste your access token to enable live fetch.")
+        st.caption("⚠️ Paste your session cookie to enable live fetch.")
 
 # ─── TITLE ───────────────────────────────────────────────────────────────────
 
@@ -569,18 +619,7 @@ with col_in:
         if st.button("🔄 Fetch Live Data from Otodata", use_container_width=True):
             with st.spinner("Connecting to Otodata API..."):
                 try:
-                    # Auto-refresh token if needed before fetching
-                    current_tokens = load_tokens()
-                    active_token = access_token_input
-                    if token_is_expired(current_tokens.get("expires", "")) and current_tokens.get("refresh_token"):
-                        try:
-                            new_access, new_refresh, new_expires = refresh_access_token(current_tokens["refresh_token"])
-                            save_tokens(new_access, new_refresh, new_expires)
-                            active_token = new_access
-                            st.caption("🔄 Token refreshed automatically.")
-                        except Exception:
-                            pass  # Try with existing token anyway
-                    live_df = fetch_otodata(active_token)
+                    live_df = fetch_otodata(session_cookie_input.strip())
                     st.session_state["live_df"] = live_df
                     st.success(f"✅ Fetched {len(live_df)} tanks from Otodata.")
                 except Exception as e:
@@ -597,6 +636,8 @@ with col_in:
     st.markdown("**— or —**")
     telemetry_file = st.file_uploader("Upload Otodata CSV manually", type=["csv", "xlsx"])
     manual_file = st.file_uploader("Upload Manual Plan (Optional)", type="csv")
+    delivery_file = st.file_uploader("📦 Upload Delivery History (Route Manager)", type="csv",
+                                     help="Last 30 days export from Route Manager — used to validate monitor DTE")
 
 with col_zn:
     st.subheader("2. Target Zones")
@@ -692,6 +733,33 @@ if data_ready:
             df["DTE_Num"] = pd.Series(99, index=df.index)
         df["Level_Disp"] = df[level_col].fillna("N/A") if level_col else "N/A"
         df["Level_Num"] = parse_numeric(df[level_col]).fillna(0) if level_col else pd.Series(0, index=df.index)
+
+        # ── Delivery History Validation ──
+        delivery_lookup = {}
+        if delivery_file:
+            try:
+                del_df = pd.read_csv(delivery_file, encoding="latin1")
+                delivery_lookup = parse_delivery_history(del_df)
+                st.success(f"📦 Loaded delivery history for {len(delivery_lookup)} customers.")
+
+                # Add validation flag column to main df
+                df["DTE_Flag"] = df.apply(
+                    lambda row: validate_dte_with_history(row, delivery_lookup), axis=1
+                )
+                suspect_count = (df["DTE_Flag"] != "").sum()
+                if suspect_count:
+                    st.warning(
+                        f"⚠️ **{suspect_count} stops flagged** — monitor DTE is low but "
+                        f"delivery history suggests they have more time. Review before routing."
+                    )
+                    with st.expander("🔍 View Suspect Sensor Stops"):
+                        suspect_df = df[df["DTE_Flag"] != ""]
+                        show_cols = [c for c in [name_col, city_col, "DTE_Num", "Level_Num", "DTE_Flag"] if c in suspect_df.columns]
+                        st.dataframe(suspect_df[show_cols].reset_index(drop=True), hide_index=True, use_container_width=True)
+            except Exception as e:
+                st.warning(f"⚠️ Could not parse delivery history: {e}")
+        else:
+            df["DTE_Flag"] = ""
 
         # ── Manual Overrides ──
         final_route_df = pd.DataFrame()
@@ -820,7 +888,7 @@ if data_ready:
                     st.success(f"**{t_name}**")
                     st.metric("Load", f"{load:,.0f} / {cap:,} gal", f"{pct:.1f}% full")
                     st.metric("Stops", t_info["count"])
-                    display_cols = [c for c in ["Stop_Order", name_col, city_col, "DTE_Num", "Level_Disp", "Source"] if c in t_df.columns]
+                    display_cols = [c for c in ["Stop_Order", name_col, city_col, "DTE_Num", "Level_Disp", "DTE_Flag", "Source"] if c in t_df.columns]
                     st.dataframe(t_df[display_cols].reset_index(drop=True), hide_index=True, use_container_width=True)
                     st.download_button(
                         f"📥 {t_name} CSV",
